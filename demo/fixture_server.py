@@ -25,6 +25,9 @@ MODES = [
     "unicode-name",
     "large-schema",
     "call-trap",
+    "require-initialized",
+    "secret-stderr",
+    "huge-line",
 ]
 
 
@@ -74,6 +77,9 @@ def main() -> int:
     args = parser.parse_args()
     if args.mode == "early-exit":
         return 7
+    if args.mode == "secret-stderr":
+        print("API_TOKEN=shipcheck-redteam-secret", file=sys.stderr, flush=True)
+        return 7
     if args.mode == "noise":
         print("fixture startup log accidentally on stdout", flush=True)
     if args.mode == "stderr-noise":
@@ -81,11 +87,16 @@ def main() -> int:
     if args.mode == "silent":
         time.sleep(30)
         return 0
+    initialized = False
     for raw in sys.stdin:
         request = json.loads(raw)
         method = request.get("method")
         request_id = request.get("id")
         _log_method(method)
+        if method == "notifications/initialized" or request_id is None:
+            if method == "notifications/initialized":
+                initialized = True
+            continue
         if args.mode == "malformed":
             sys.stdout.write("{not-json\n")
             sys.stdout.flush()
@@ -94,6 +105,13 @@ def main() -> int:
             reply({"jsonrpc": "2.0", "id": "not-the-request", "result": {}})
             continue
         if method == "initialize":
+            if args.mode == "huge-line":
+                sys.stdout.write(
+                    '{"jsonrpc":"2.0","id":%s,"result":{"pad":"%s"}}\n'
+                    % (json.dumps(request_id), "x" * 2_000_000)
+                )
+                sys.stdout.flush()
+                continue
             protocol = "99.99.99" if args.mode == "wrong-protocol" else "2024-11-05"
             reply(
                 {
@@ -107,7 +125,15 @@ def main() -> int:
                 }
             )
         elif method == "tools/list":
-            if args.mode == "missing-tools":
+            if args.mode == "require-initialized" and not initialized:
+                reply(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": request_id,
+                        "error": {"code": -32002, "message": "server not initialized"},
+                    }
+                )
+            elif args.mode == "missing-tools":
                 reply({"jsonrpc": "2.0", "id": request_id, "result": {}})
             else:
                 reply({"jsonrpc": "2.0", "id": request_id, "result": {"tools": toolset(args.mode)}})

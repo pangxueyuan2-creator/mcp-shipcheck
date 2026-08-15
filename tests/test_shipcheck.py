@@ -102,8 +102,50 @@ class ProbeTests(unittest.TestCase):
             )
             self.assertEqual(result.returncode, 0, result.stderr)
             methods = log_path.read_text(encoding="utf-8").splitlines()
-            self.assertEqual(methods, ["initialize", "tools/list"])
+            self.assertEqual(methods, ["initialize", "notifications/initialized", "tools/list"])
             self.assertNotIn("tools/call", methods)
+
+    def test_probe_sends_initialized_before_tools_list(self) -> None:
+        snapshot = probe_command(command("require-initialized"), timeout=1)
+        self.assertEqual(snapshot["probe"]["toolCallsExecuted"], 0)
+        self.assertEqual([tool["name"] for tool in snapshot["tools"]], ["read_note", "search_notes"])
+
+    def test_probe_does_not_surface_stderr_secrets(self) -> None:
+        with self.assertRaises(StartupError) as ctx:
+            probe_command(command("secret-stderr"), timeout=1)
+        self.assertNotIn("shipcheck-redteam-secret", str(ctx.exception))
+        self.assertNotIn("API_TOKEN", str(ctx.exception))
+        environment = os.environ.copy()
+        environment["PYTHONPATH"] = str(ROOT / "src")
+        with tempfile.TemporaryDirectory() as directory:
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "mcp_shipcheck",
+                    "verify",
+                    "--output",
+                    str(Path(directory) / "snap.json"),
+                    "--",
+                    *command("secret-stderr"),
+                ],
+                cwd=ROOT,
+                env=environment,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+        self.assertEqual(result.returncode, 1)
+        self.assertNotIn("shipcheck-redteam-secret", result.stdout)
+        self.assertNotIn("shipcheck-redteam-secret", result.stderr)
+        self.assertNotIn("API_TOKEN", result.stdout)
+        self.assertNotIn("API_TOKEN", result.stderr)
+
+    def test_probe_rejects_oversized_jsonrpc_line(self) -> None:
+        with self.assertRaises(ProtocolError) as ctx:
+            probe_command(command("huge-line"), timeout=2)
+        self.assertIn("exceeds", str(ctx.exception))
+        self.assertLess(len(str(ctx.exception)), 500)
 
 
 class CompareTests(unittest.TestCase):
