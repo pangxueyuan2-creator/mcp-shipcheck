@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mcp-shipcheck"
+version = "0.1.0"
+description = "Release-artifact smoke checks for stdio MCP servers."
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [{name = "MCP ShipCheck contributors"}]
+keywords = ["mcp", "model-context-protocol", "release", "contract-testing", "ci"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Topic :: Software Development :: Testing",
+]
+
+[project.scripts]
+mcp-shipcheck = "mcp_shipcheck.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/pangxueyuan2-creator/mcp-shipcheck"
+Repository = "https://github.com/pangxueyuan2-creator/mcp-shipcheck"
+Issues = "https://github.com/pangxueyuan2-creator/mcp-shipcheck/issues"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
