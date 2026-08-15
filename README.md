@@ -87,7 +87,7 @@ python -m unittest discover -s tests -v
 bash demo/run_demo.sh
 ```
 
-The project targets Python 3.10+ and uses no runtime dependencies outside the standard library. See [`CONTRIBUTING.md`](CONTRIBUTING.md) and [`SECURITY.md`](SECURITY.md).
+The project targets Python 3.10+ and uses no runtime dependencies outside the standard library. The stdio probe waits for each JSON-RPC line on a worker thread (not `select`), so the timeout path works on Windows pipes as well as POSIX. See [`CONTRIBUTING.md`](CONTRIBUTING.md) and [`SECURITY.md`](SECURITY.md).
 
 ## License
 

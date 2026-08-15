@@ -8,8 +8,9 @@ from __future__ import annotations
 
 import json
 import os
-import select
+import queue
 import subprocess
+import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -60,23 +61,43 @@ def _canonical(value: Any) -> Any:
     return value
 
 
+def _stderr_tail(process: subprocess.Popen[str]) -> str:
+    if process.stderr is None:
+        return ""
+    return process.stderr.read().strip()
+
+
 def _readline(process: subprocess.Popen[str], timeout: float) -> str:
+    """Read one stdout line with a portable timeout.
+
+    ``select.select`` is not defined for Windows pipes and raises OSError
+    (WinError 10038 / 10093). A worker thread plus ``queue.Queue.get``
+    works on POSIX and Windows.
+    """
+
     if process.stdout is None:
         raise ProtocolError("server stdout is unavailable")
-    ready, _, _ = select.select([process.stdout], [], [], timeout)
-    if not ready:
+    lines: queue.Queue[str | None] = queue.Queue(maxsize=1)
+
+    def reader() -> None:
+        try:
+            lines.put(process.stdout.readline() if process.stdout is not None else None)
+        except OSError:
+            lines.put(None)
+
+    threading.Thread(target=reader, daemon=True).start()
+    try:
+        line = lines.get(timeout=timeout)
+    except queue.Empty:
         if process.poll() is not None:
-            stderr = ""
-            if process.stderr is not None:
-                stderr = process.stderr.read().strip()
+            stderr = _stderr_tail(process)
             detail = f"; stderr: {stderr}" if stderr else ""
-            raise StartupError(f"server exited before responding (exit {process.returncode}){detail}")
-        raise ProbeTimeout(f"no JSON-RPC response within {timeout:.2f}s")
-    line = process.stdout.readline()
+            raise StartupError(
+                f"server exited before responding (exit {process.returncode}){detail}"
+            )
+        raise ProbeTimeout(f"no JSON-RPC response within {timeout:.2f}s") from None
     if not line:
-        stderr = ""
-        if process.stderr is not None:
-            stderr = process.stderr.read().strip()
+        stderr = _stderr_tail(process)
         detail = f"; stderr: {stderr}" if stderr else ""
         raise StartupError(f"server closed stdout before responding{detail}")
     return line
@@ -159,17 +180,25 @@ def probe_command(command: Iterable[str], timeout: float = 5.0) -> dict[str, Any
             },
             timeout,
         )
+        protocol_version = initialize.get("protocolVersion", PROTOCOL_VERSION)
+        if not isinstance(protocol_version, str) or not protocol_version:
+            raise ProtocolError("initialize protocolVersion is not a non-empty string")
         tools_result = _request(server, 2, "tools/list", {}, timeout)
-        raw_tools = tools_result.get("tools", [])
+        if "tools" not in tools_result:
+            raise ProtocolError("tools/list result has no tools array")
+        raw_tools = tools_result.get("tools")
         if not isinstance(raw_tools, list) or not all(isinstance(tool, dict) for tool in raw_tools):
             raise ProtocolError("tools/list result has no tools array")
+        names = [str(tool.get("name", "")) for tool in raw_tools]
+        if len(names) != len(set(names)):
+            raise ProtocolError("tools/list contains duplicate tool names")
         tools = sorted((_normalize_tool(tool) for tool in raw_tools), key=lambda tool: tool["name"])
         if any(not tool["name"] for tool in tools):
             raise ProtocolError("tools/list contains a tool without a non-empty name")
         elapsed_ms = round((time.monotonic() - started) * 1000)
         return {
             "format": "mcp-shipcheck/v1",
-            "protocolVersion": initialize.get("protocolVersion", PROTOCOL_VERSION),
+            "protocolVersion": protocol_version,
             "serverInfo": _canonical(initialize.get("serverInfo", {})),
             "capabilities": _canonical(initialize.get("capabilities", {})),
             "tools": tools,
