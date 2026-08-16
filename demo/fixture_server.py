@@ -28,6 +28,7 @@ MODES = [
     "require-initialized",
     "secret-stderr",
     "huge-line",
+    "bom",
 ]
 
 

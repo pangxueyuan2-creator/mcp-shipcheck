@@ -141,6 +141,11 @@ class ProbeTests(unittest.TestCase):
         self.assertNotIn("API_TOKEN", result.stdout)
         self.assertNotIn("API_TOKEN", result.stderr)
 
+    def test_probe_accepts_bom_prefixed_json(self) -> None:
+        snapshot = probe_command(command("bom"), timeout=1)
+        self.assertEqual(snapshot["protocolVersion"], "2024-11-05")
+        self.assertEqual(snapshot["probe"]["toolCallsExecuted"], 0)
+
     def test_probe_rejects_oversized_jsonrpc_line(self) -> None:
         with self.assertRaises(ProtocolError) as ctx:
             probe_command(command("huge-line"), timeout=2)
