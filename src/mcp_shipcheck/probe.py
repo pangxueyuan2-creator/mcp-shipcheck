@@ -17,6 +17,7 @@ from datetime import datetime, timezone
 from typing import Any, Iterable
 
 PROTOCOL_VERSION = "2024-11-05"
+SUPPORTED_PROTOCOL_VERSIONS = frozenset({PROTOCOL_VERSION})
 MAX_JSONRPC_LINE = 1_048_576
 
 
@@ -209,6 +210,8 @@ def probe_command(command: Iterable[str], timeout: float = 5.0) -> dict[str, Any
         protocol_version = initialize.get("protocolVersion", PROTOCOL_VERSION)
         if not isinstance(protocol_version, str) or not protocol_version:
             raise ProtocolError("initialize protocolVersion is not a non-empty string")
+        if protocol_version not in SUPPORTED_PROTOCOL_VERSIONS:
+            raise ProtocolError(f"unsupported initialize protocolVersion: {protocol_version!r}")
         _write(
             process,
             {"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}},
