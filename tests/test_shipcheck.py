@@ -12,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from mcp_shipcheck.compare import compare_snapshots
-from mcp_shipcheck.probe import ProbeTimeout, ProtocolError, probe_command
+from mcp_shipcheck.probe import ProbeTimeout, ProtocolError, StartupError, probe_command
 
 FIXTURE = ROOT / "demo" / "fixture_server.py"
 
@@ -36,6 +36,116 @@ class ProbeTests(unittest.TestCase):
     def test_probe_times_out(self) -> None:
         with self.assertRaises(ProbeTimeout):
             probe_command(command("silent"), timeout=0.05)
+
+    def test_probe_rejects_early_exit(self) -> None:
+        with self.assertRaises(StartupError):
+            probe_command(command("early-exit"), timeout=1)
+
+    def test_probe_rejects_malformed_json(self) -> None:
+        with self.assertRaises(ProtocolError):
+            probe_command(command("malformed"), timeout=1)
+
+    def test_probe_rejects_wrong_jsonrpc_id(self) -> None:
+        with self.assertRaises(ProtocolError):
+            probe_command(command("wrong-id"), timeout=1)
+
+    def test_probe_records_unusual_protocol_version(self) -> None:
+        snapshot = probe_command(command("wrong-protocol"), timeout=1)
+        self.assertEqual(snapshot["protocolVersion"], "99.99.99")
+        self.assertEqual(snapshot["probe"]["toolCallsExecuted"], 0)
+
+    def test_probe_rejects_missing_tools_array(self) -> None:
+        with self.assertRaises(ProtocolError):
+            probe_command(command("missing-tools"), timeout=1)
+
+    def test_probe_rejects_duplicate_tool_names(self) -> None:
+        with self.assertRaises(ProtocolError):
+            probe_command(command("duplicate-names"), timeout=1)
+
+    def test_probe_accepts_unicode_tool_name(self) -> None:
+        snapshot = probe_command(command("unicode-name"), timeout=1)
+        self.assertEqual([tool["name"] for tool in snapshot["tools"]], ["读取笔记"])
+
+    def test_probe_accepts_large_input_schema(self) -> None:
+        snapshot = probe_command(command("large-schema"), timeout=1)
+        self.assertEqual(len(snapshot["tools"][0]["inputSchema"]["properties"]), 200)
+
+    def test_probe_ignores_stderr_startup_noise(self) -> None:
+        snapshot = probe_command(command("stderr-noise"), timeout=1)
+        self.assertEqual(snapshot["probe"]["toolCallsExecuted"], 0)
+        self.assertEqual([tool["name"] for tool in snapshot["tools"]], ["read_note", "search_notes"])
+
+    def test_probe_never_sends_tools_call(self) -> None:
+        snapshot = probe_command(command("call-trap"), timeout=1)
+        self.assertEqual(snapshot["probe"]["toolCallsExecuted"], 0)
+        with tempfile.TemporaryDirectory() as directory:
+            log_path = Path(directory) / "methods.log"
+            environment = os.environ.copy()
+            environment["MCP_SHIPCHECK_METHOD_LOG"] = str(log_path)
+            environment["PYTHONPATH"] = str(ROOT / "src")
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "mcp_shipcheck",
+                    "verify",
+                    "--output",
+                    str(Path(directory) / "snap.json"),
+                    "--",
+                    *command("call-trap"),
+                ],
+                cwd=ROOT,
+                env=environment,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            methods = log_path.read_text(encoding="utf-8").splitlines()
+            self.assertEqual(methods, ["initialize", "notifications/initialized", "tools/list"])
+            self.assertNotIn("tools/call", methods)
+
+    def test_probe_sends_initialized_before_tools_list(self) -> None:
+        snapshot = probe_command(command("require-initialized"), timeout=1)
+        self.assertEqual(snapshot["probe"]["toolCallsExecuted"], 0)
+        self.assertEqual([tool["name"] for tool in snapshot["tools"]], ["read_note", "search_notes"])
+
+    def test_probe_does_not_surface_stderr_secrets(self) -> None:
+        with self.assertRaises(StartupError) as ctx:
+            probe_command(command("secret-stderr"), timeout=1)
+        self.assertNotIn("shipcheck-redteam-secret", str(ctx.exception))
+        self.assertNotIn("API_TOKEN", str(ctx.exception))
+        environment = os.environ.copy()
+        environment["PYTHONPATH"] = str(ROOT / "src")
+        with tempfile.TemporaryDirectory() as directory:
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "mcp_shipcheck",
+                    "verify",
+                    "--output",
+                    str(Path(directory) / "snap.json"),
+                    "--",
+                    *command("secret-stderr"),
+                ],
+                cwd=ROOT,
+                env=environment,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+        self.assertEqual(result.returncode, 1)
+        self.assertNotIn("shipcheck-redteam-secret", result.stdout)
+        self.assertNotIn("shipcheck-redteam-secret", result.stderr)
+        self.assertNotIn("API_TOKEN", result.stdout)
+        self.assertNotIn("API_TOKEN", result.stderr)
+
+    def test_probe_rejects_oversized_jsonrpc_line(self) -> None:
+        with self.assertRaises(ProtocolError) as ctx:
+            probe_command(command("huge-line"), timeout=2)
+        self.assertIn("exceeds", str(ctx.exception))
+        self.assertLess(len(str(ctx.exception)), 500)
 
 
 class CompareTests(unittest.TestCase):

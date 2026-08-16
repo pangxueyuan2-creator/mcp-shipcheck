@@ -8,14 +8,16 @@ from __future__ import annotations
 
 import json
 import os
-import select
+import queue
 import subprocess
+import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Iterable
 
 PROTOCOL_VERSION = "2024-11-05"
+MAX_JSONRPC_LINE = 1_048_576
 
 
 class ShipcheckError(RuntimeError):
@@ -36,7 +38,8 @@ class ProtocolError(ShipcheckError):
 
 @dataclass
 class _ServerProcess:
-    process: subprocess.Popen[str]
+    process: subprocess.Popen[bytes]
+    leftover: bytearray = field(default_factory=bytearray)
 
     def close(self) -> None:
         if self.process.poll() is None:
@@ -60,39 +63,79 @@ def _canonical(value: Any) -> Any:
     return value
 
 
-def _readline(process: subprocess.Popen[str], timeout: float) -> str:
+def _read_available(stream: Any, size: int, timeout: float) -> bytes | None:
+    """Read up to ``size`` bytes with a portable timeout.
+
+    ``select.select`` is not defined for Windows pipes and raises OSError
+    (WinError 10038 / 10093). A worker thread plus ``queue.Queue.get``
+    works on POSIX and Windows. ``None`` means timeout.
+    """
+
+    chunks: queue.Queue[bytes | None] = queue.Queue(maxsize=1)
+
+    def reader() -> None:
+        try:
+            data = stream.read1(size) if hasattr(stream, "read1") else stream.read(size)
+            chunks.put(b"" if data is None else data)
+        except OSError:
+            chunks.put(None)
+
+    threading.Thread(target=reader, daemon=True).start()
+    try:
+        return chunks.get(timeout=timeout)
+    except queue.Empty:
+        return None
+
+
+def _readline(server: _ServerProcess, timeout: float) -> str:
+    """Read one stdout JSON-RPC line, bounded to ``MAX_JSONRPC_LINE`` bytes."""
+
+    process = server.process
     if process.stdout is None:
         raise ProtocolError("server stdout is unavailable")
-    ready, _, _ = select.select([process.stdout], [], [], timeout)
-    if not ready:
-        if process.poll() is not None:
-            stderr = ""
-            if process.stderr is not None:
-                stderr = process.stderr.read().strip()
-            detail = f"; stderr: {stderr}" if stderr else ""
-            raise StartupError(f"server exited before responding (exit {process.returncode}){detail}")
-        raise ProbeTimeout(f"no JSON-RPC response within {timeout:.2f}s")
-    line = process.stdout.readline()
-    if not line:
-        stderr = ""
-        if process.stderr is not None:
-            stderr = process.stderr.read().strip()
-        detail = f"; stderr: {stderr}" if stderr else ""
-        raise StartupError(f"server closed stdout before responding{detail}")
-    return line
+    leftover = server.leftover
+    deadline = time.monotonic() + timeout
+    while True:
+        newline = leftover.find(b"\n")
+        if newline != -1:
+            raw = bytes(leftover[:newline])
+            del leftover[: newline + 1]
+            if len(raw) > MAX_JSONRPC_LINE:
+                raise ProtocolError(f"JSON-RPC line exceeds {MAX_JSONRPC_LINE} bytes")
+            return raw.decode("utf-8")
+        if len(leftover) > MAX_JSONRPC_LINE:
+            raise ProtocolError(f"JSON-RPC line exceeds {MAX_JSONRPC_LINE} bytes")
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            if process.poll() is not None:
+                raise StartupError(f"server exited before responding (exit {process.returncode})")
+            raise ProbeTimeout(f"no JSON-RPC response within {timeout:.2f}s") from None
+        chunk = _read_available(process.stdout, 65_536, remaining)
+        if chunk is None:
+            if process.poll() is not None:
+                raise StartupError(f"server exited before responding (exit {process.returncode})")
+            raise ProbeTimeout(f"no JSON-RPC response within {timeout:.2f}s") from None
+        if not chunk:
+            raise StartupError("server closed stdout before responding")
+        leftover.extend(chunk)
 
 
-def _request(server: _ServerProcess, request_id: int, method: str, params: dict[str, Any], timeout: float) -> dict[str, Any]:
-    process = server.process
+def _write(process: subprocess.Popen[bytes], payload: dict[str, Any]) -> None:
     if process.stdin is None:
         raise StartupError("server stdin is unavailable")
-    payload = {"jsonrpc": "2.0", "id": request_id, "method": method, "params": params}
     try:
-        process.stdin.write(json.dumps(payload, separators=(",", ":")) + "\n")
+        process.stdin.write((json.dumps(payload, separators=(",", ":")) + "\n").encode("utf-8"))
         process.stdin.flush()
     except (BrokenPipeError, OSError) as exc:
         raise StartupError(f"could not write to server: {exc}") from exc
-    raw = _readline(process, timeout)
+
+
+def _request(
+    server: _ServerProcess, request_id: int, method: str, params: dict[str, Any], timeout: float
+) -> dict[str, Any]:
+    process = server.process
+    _write(process, {"jsonrpc": "2.0", "id": request_id, "method": method, "params": params})
+    raw = _readline(server, timeout)
     try:
         response = json.loads(raw)
     except json.JSONDecodeError as exc:
@@ -124,9 +167,10 @@ def _normalize_tool(tool: dict[str, Any]) -> dict[str, Any]:
 def probe_command(command: Iterable[str], timeout: float = 5.0) -> dict[str, Any]:
     """Probe a stdio MCP server and return a JSON-serializable release snapshot.
 
-    ``command`` is executed without a shell. Only initialize and tools/list are
-    requested; no tool calls, environment values, request arguments, or tool
-    outputs are captured.
+    ``command`` is executed without a shell. Only initialize, the initialized
+    notification, and tools/list are requested; no tool calls, environment
+    values, request arguments, or tool outputs are captured. Server stderr is
+    discarded and is never included in probe errors.
     """
     argv = list(command)
     if argv[:1] == ["--"]:
@@ -139,9 +183,9 @@ def probe_command(command: Iterable[str], timeout: float = 5.0) -> dict[str, Any
             argv,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            bufsize=1,
+            stderr=subprocess.DEVNULL,
+            text=False,
+            bufsize=0,
             env=os.environ.copy(),
         )
     except OSError as exc:
@@ -159,17 +203,29 @@ def probe_command(command: Iterable[str], timeout: float = 5.0) -> dict[str, Any
             },
             timeout,
         )
+        protocol_version = initialize.get("protocolVersion", PROTOCOL_VERSION)
+        if not isinstance(protocol_version, str) or not protocol_version:
+            raise ProtocolError("initialize protocolVersion is not a non-empty string")
+        _write(
+            process,
+            {"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}},
+        )
         tools_result = _request(server, 2, "tools/list", {}, timeout)
-        raw_tools = tools_result.get("tools", [])
+        if "tools" not in tools_result:
+            raise ProtocolError("tools/list result has no tools array")
+        raw_tools = tools_result.get("tools")
         if not isinstance(raw_tools, list) or not all(isinstance(tool, dict) for tool in raw_tools):
             raise ProtocolError("tools/list result has no tools array")
+        names = [str(tool.get("name", "")) for tool in raw_tools]
+        if len(names) != len(set(names)):
+            raise ProtocolError("tools/list contains duplicate tool names")
         tools = sorted((_normalize_tool(tool) for tool in raw_tools), key=lambda tool: tool["name"])
         if any(not tool["name"] for tool in tools):
             raise ProtocolError("tools/list contains a tool without a non-empty name")
         elapsed_ms = round((time.monotonic() - started) * 1000)
         return {
             "format": "mcp-shipcheck/v1",
-            "protocolVersion": initialize.get("protocolVersion", PROTOCOL_VERSION),
+            "protocolVersion": protocol_version,
             "serverInfo": _canonical(initialize.get("serverInfo", {})),
             "capabilities": _canonical(initialize.get("capabilities", {})),
             "tools": tools,
