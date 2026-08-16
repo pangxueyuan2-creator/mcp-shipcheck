@@ -49,10 +49,11 @@ class ProbeTests(unittest.TestCase):
         with self.assertRaises(ProtocolError):
             probe_command(command("wrong-id"), timeout=1)
 
-    def test_probe_records_unusual_protocol_version(self) -> None:
-        snapshot = probe_command(command("wrong-protocol"), timeout=1)
-        self.assertEqual(snapshot["protocolVersion"], "99.99.99")
-        self.assertEqual(snapshot["probe"]["toolCallsExecuted"], 0)
+    def test_probe_rejects_unsupported_protocol_version(self) -> None:
+        with self.assertRaises(ProtocolError) as ctx:
+            probe_command(command("wrong-protocol"), timeout=1)
+        self.assertIn("not supported", str(ctx.exception))
+        self.assertIn("99.99.99", str(ctx.exception))
 
     def test_probe_rejects_missing_tools_array(self) -> None:
         with self.assertRaises(ProtocolError):
