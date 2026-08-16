@@ -147,6 +147,16 @@ class ProbeTests(unittest.TestCase):
         self.assertIn("exceeds", str(ctx.exception))
         self.assertLess(len(str(ctx.exception)), 500)
 
+    def test_probe_rejects_non_utf8_stdout(self) -> None:
+        with self.assertRaises(ProtocolError) as ctx:
+            probe_command(command("non-utf8"), timeout=1)
+        self.assertIn("non-UTF-8", str(ctx.exception))
+
+    def test_probe_rejects_non_string_tool_name(self) -> None:
+        with self.assertRaises(ProtocolError) as ctx:
+            probe_command(command("int-name"), timeout=1)
+        self.assertIn("non-empty string name", str(ctx.exception))
+
 
 class CompareTests(unittest.TestCase):
     def test_added_tool_is_compatible(self) -> None:
@@ -167,6 +177,39 @@ class CompareTests(unittest.TestCase):
         baseline = {"format": "mcp-shipcheck/v1", "protocolVersion": "2024-11-05", "capabilities": {}, "tools": [{"name": "read", "description": "old", "inputSchema": {"type": "object", "properties": {}}}]}
         candidate = {"format": "mcp-shipcheck/v1", "protocolVersion": "2024-11-05", "capabilities": {}, "tools": [{"name": "read", "description": "new", "inputSchema": {"type": "object", "properties": {}}}]}
         self.assertTrue(compare_snapshots(baseline, candidate)["compatible"])
+
+    def _snapshot(self, properties: dict) -> dict:
+        return {
+            "format": "mcp-shipcheck/v1",
+            "protocolVersion": "2024-11-05",
+            "capabilities": {},
+            "tools": [
+                {"name": "run", "inputSchema": {"type": "object", "properties": properties}}
+            ],
+        }
+
+    def test_new_const_on_existing_input_is_breaking(self) -> None:
+        baseline = self._snapshot({"mode": {"type": "string"}})
+        candidate = self._snapshot({"mode": {"type": "string", "const": "safe"}})
+        result = compare_snapshots(baseline, candidate)
+        self.assertFalse(result["compatible"])
+        self.assertIn("input-restricted", {change["kind"] for change in result["changes"]})
+
+    def test_new_type_or_enum_constraints_are_breaking(self) -> None:
+        baseline = self._snapshot({"mode": {}, "flavor": {}})
+        candidate = self._snapshot({"mode": {"type": "string"}, "flavor": {"enum": ["a", "b"]}})
+        result = compare_snapshots(baseline, candidate)
+        self.assertFalse(result["compatible"])
+        self.assertEqual(
+            sum(change["kind"] == "input-restricted" for change in result["changes"]), 2
+        )
+
+    def test_removing_a_type_constraint_is_compatible(self) -> None:
+        baseline = self._snapshot({"mode": {"type": "string"}})
+        candidate = self._snapshot({"mode": {}})
+        result = compare_snapshots(baseline, candidate)
+        self.assertTrue(result["compatible"])
+        self.assertNotIn("input-restricted", {change["kind"] for change in result["changes"]})
 
 
 class CliTests(unittest.TestCase):
