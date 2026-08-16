@@ -102,7 +102,10 @@ def _readline(server: _ServerProcess, timeout: float) -> str:
             del leftover[: newline + 1]
             if len(raw) > MAX_JSONRPC_LINE:
                 raise ProtocolError(f"JSON-RPC line exceeds {MAX_JSONRPC_LINE} bytes")
-            return raw.decode("utf-8")
+            try:
+                return raw.decode("utf-8")
+            except UnicodeDecodeError:
+                raise ProtocolError("server wrote non-UTF-8 output to stdout") from None
         if len(leftover) > MAX_JSONRPC_LINE:
             raise ProtocolError(f"JSON-RPC line exceeds {MAX_JSONRPC_LINE} bytes")
         remaining = deadline - time.monotonic()
@@ -216,12 +219,14 @@ def probe_command(command: Iterable[str], timeout: float = 5.0) -> dict[str, Any
         raw_tools = tools_result.get("tools")
         if not isinstance(raw_tools, list) or not all(isinstance(tool, dict) for tool in raw_tools):
             raise ProtocolError("tools/list result has no tools array")
-        names = [str(tool.get("name", "")) for tool in raw_tools]
+        for tool in raw_tools:
+            name = tool.get("name")
+            if not isinstance(name, str) or not name.strip():
+                raise ProtocolError("tools/list contains a tool without a non-empty string name")
+        names = [tool["name"] for tool in raw_tools]
         if len(names) != len(set(names)):
             raise ProtocolError("tools/list contains duplicate tool names")
         tools = sorted((_normalize_tool(tool) for tool in raw_tools), key=lambda tool: tool["name"])
-        if any(not tool["name"] for tool in tools):
-            raise ProtocolError("tools/list contains a tool without a non-empty name")
         elapsed_ms = round((time.monotonic() - started) * 1000)
         return {
             "format": "mcp-shipcheck/v1",

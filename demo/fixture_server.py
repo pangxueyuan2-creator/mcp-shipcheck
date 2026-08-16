@@ -28,6 +28,8 @@ MODES = [
     "require-initialized",
     "secret-stderr",
     "huge-line",
+    "non-utf8",
+    "int-name",
 ]
 
 
@@ -55,6 +57,8 @@ def toolset(mode: str) -> list[dict]:
         return [tool("bulk_note", properties, ["field_0"], "Large schema.")]
     if mode == "missing-tools":
         return []
+    if mode == "int-name":
+        return [{"name": 12345, "description": "bad name type", "inputSchema": {}}]
     return [read, search]
 
 
@@ -105,6 +109,10 @@ def main() -> int:
             reply({"jsonrpc": "2.0", "id": "not-the-request", "result": {}})
             continue
         if method == "initialize":
+            if args.mode == "non-utf8":
+                sys.stdout.buffer.write(b'{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"\xff\xfe"}}\n')
+                sys.stdout.flush()
+                continue
             if args.mode == "huge-line":
                 sys.stdout.write(
                     '{"jsonrpc":"2.0","id":%s,"result":{"pad":"%s"}}\n'

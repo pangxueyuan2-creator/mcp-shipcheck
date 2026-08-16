@@ -39,14 +39,20 @@ def _compare_schema(old: dict[str, Any], new: dict[str, Any], path: str) -> list
             continue
         old_value, new_value = old_properties[field], new_properties[field]
         old_type, new_type = old_value.get("type"), new_value.get("type")
-        if old_type != new_type:
+        if old_type is None and new_type is not None:
+            changes.append(_change("input-restricted", "breaking", property_path, f"input {field!r} gained a type constraint"))
+        elif new_type is not None and old_type != new_type:
             changes.append(_change("input-type-changed", "breaking", property_path, f"input {field!r} type changed from {old_type!r} to {new_type!r}"))
         old_enum, new_enum = old_value.get("enum"), new_value.get("enum")
-        if isinstance(old_enum, list) and isinstance(new_enum, list):
+        if old_enum is None and isinstance(new_enum, list):
+            changes.append(_change("input-restricted", "breaking", property_path, f"input {field!r} gained an enum constraint"))
+        elif isinstance(old_enum, list) and isinstance(new_enum, list):
             removed = sorted(set(old_enum) - set(new_enum), key=repr)
             if removed:
                 changes.append(_change("enum-narrowed", "breaking", property_path, f"input {field!r} no longer accepts {removed!r}"))
-        if old_value.get("const") != new_value.get("const") and "const" in old_value and "const" in new_value:
+        if "const" not in old_value and "const" in new_value:
+            changes.append(_change("input-restricted", "breaking", property_path, f"input {field!r} gained a const constraint"))
+        elif "const" in old_value and "const" in new_value and old_value.get("const") != new_value.get("const"):
             changes.append(_change("const-changed", "breaking", property_path, f"input {field!r} const changed"))
     for field in sorted(new_properties.keys() - old_properties.keys() - new_required):
         changes.append(_change("input-added", "non-breaking", f"{path}.properties.{field}", f"optional input {field!r} was added"))
