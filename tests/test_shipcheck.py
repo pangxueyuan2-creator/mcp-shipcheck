@@ -229,3 +229,68 @@ class CliTests(unittest.TestCase):
             result = self.run_cli("verify", "--baseline", str(baseline), "--output", str(candidate), "--", *command("breaking"))
             self.assertEqual(result.returncode, 2)
             self.assertIn("breaking change", result.stderr)
+
+
+
+class NestedConstraintCompareTests(unittest.TestCase):
+    def _snapshot(self, schema: dict) -> dict:
+        return {
+            "format": "mcp-shipcheck/v1",
+            "protocolVersion": "2024-11-05",
+            "capabilities": {},
+            "tools": [{"name": "run", "inputSchema": schema}],
+        }
+
+    def test_nested_object_enum_narrowing_is_breaking(self) -> None:
+        baseline = self._snapshot(
+            {"type": "object", "properties": {"cfg": {"type": "object", "properties": {"level": {"type": "string", "enum": ["a", "b", "c"]}}}}}
+        )
+        candidate = self._snapshot(
+            {"type": "object", "properties": {"cfg": {"type": "object", "properties": {"level": {"type": "string", "enum": ["a"]}}}}}
+        )
+        result = compare_snapshots(baseline, candidate)
+        self.assertFalse(result["compatible"])
+        self.assertIn("enum-narrowed", {change["kind"] for change in result["changes"]})
+
+    def test_nested_object_required_addition_is_breaking(self) -> None:
+        baseline = self._snapshot(
+            {"type": "object", "properties": {"cfg": {"type": "object", "properties": {"x": {"type": "string"}}}}}
+        )
+        candidate = self._snapshot(
+            {"type": "object", "properties": {"cfg": {"type": "object", "required": ["x"], "properties": {"x": {"type": "string"}}}}}
+        )
+        result = compare_snapshots(baseline, candidate)
+        self.assertFalse(result["compatible"])
+        self.assertIn("required-added", {change["kind"] for change in result["changes"]})
+
+    def test_defs_ref_enum_narrowing_is_breaking(self) -> None:
+        baseline = self._snapshot(
+            {"type": "object", "properties": {"x": {"$ref": "#/$defs/x"}}, "$defs": {"x": {"type": "string", "enum": ["a", "b"]}}}
+        )
+        candidate = self._snapshot(
+            {"type": "object", "properties": {"x": {"$ref": "#/$defs/x"}}, "$defs": {"x": {"type": "string", "enum": ["a"]}}}
+        )
+        result = compare_snapshots(baseline, candidate)
+        self.assertFalse(result["compatible"])
+        self.assertIn("enum-narrowed", {change["kind"] for change in result["changes"]})
+
+    def test_new_pattern_and_length_constraints_are_breaking(self) -> None:
+        baseline = self._snapshot(
+            {"type": "object", "properties": {"mode": {"type": "string"}}}
+        )
+        candidate = self._snapshot(
+            {"type": "object", "properties": {"mode": {"type": "string", "pattern": "^[a-z]+$", "minLength": 4}}}
+        )
+        result = compare_snapshots(baseline, candidate)
+        self.assertFalse(result["compatible"])
+        self.assertIn("input-restricted", {change["kind"] for change in result["changes"]})
+
+    def test_self_referential_defs_terminate(self) -> None:
+        baseline = self._snapshot(
+            {"type": "object", "properties": {"node": {"$ref": "#/$defs/node"}}, "$defs": {"node": {"type": "object", "properties": {"next": {"$ref": "#/$defs/node"}}}}}
+        )
+        candidate = self._snapshot(
+            {"type": "object", "properties": {"node": {"$ref": "#/$defs/node"}}, "$defs": {"node": {"type": "object", "properties": {"next": {"$ref": "#/$defs/node"}}}}}
+        )
+        result = compare_snapshots(baseline, candidate)
+        self.assertTrue(result["compatible"])

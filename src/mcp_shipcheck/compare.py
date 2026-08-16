@@ -26,8 +26,61 @@ def _change(kind: str, severity: str, path: str, message: str) -> dict[str, str]
     return {"kind": kind, "severity": severity, "path": path, "message": message}
 
 
-def _compare_schema(old: dict[str, Any], new: dict[str, Any], path: str) -> list[dict[str, str]]:
+_MAX_SCHEMA_DEPTH = 8
+_RESTRICTING_KEYWORDS = (
+    "pattern",
+    "minLength",
+    "maxLength",
+    "minItems",
+    "maxItems",
+    "minimum",
+    "maximum",
+)
+
+
+def _deref(schema: dict[str, Any], defs: dict[str, Any], guard: set[str]) -> dict[str, Any]:
+    """Resolve a local $defs reference chain with a cycle guard."""
+
+    while (
+        isinstance(schema, dict)
+        and isinstance(schema.get("$ref"), str)
+        and schema["$ref"].startswith("#/$defs/")
+    ):
+        name = schema["$ref"][len("#/$defs/") :]
+        if name in guard or not isinstance(defs.get(name), dict):
+            break
+        guard.add(name)
+        schema = defs[name]
+    return schema
+
+
+def _compare_schema(
+    old: dict[str, Any],
+    new: dict[str, Any],
+    path: str,
+    *,
+    defs_old: dict[str, Any] | None = None,
+    defs_new: dict[str, Any] | None = None,
+    depth: int = 0,
+    seen: set[tuple[int, int]] | None = None,
+) -> list[dict[str, str]]:
+    """Compare schemas recursively so constraints behind nested objects and
+    local $refs are classified instead of silently passing as compatible."""
+
     changes: list[dict[str, str]] = []
+    if depth > _MAX_SCHEMA_DEPTH or not isinstance(old, dict) or not isinstance(new, dict):
+        return changes
+    seen = seen if seen is not None else set()
+    pair = (id(old), id(new))
+    if pair in seen:
+        return changes
+    seen.add(pair)
+
+    defs_old = old.get("$defs") if isinstance(old.get("$defs"), dict) else (defs_old or {})
+    defs_new = new.get("$defs") if isinstance(new.get("$defs"), dict) else (defs_new or {})
+    old = _deref(old, defs_old, set())
+    new = _deref(new, defs_new, set())
+
     old_required, new_required = _required(old), _required(new)
     for field in sorted(new_required - old_required):
         changes.append(_change("required-added", "breaking", f"{path}.properties.{field}", f"input {field!r} became required"))
@@ -38,6 +91,9 @@ def _compare_schema(old: dict[str, Any], new: dict[str, Any], path: str) -> list
             changes.append(_change("input-removed", "breaking", property_path, f"input {field!r} was removed"))
             continue
         old_value, new_value = old_properties[field], new_properties[field]
+        if isinstance(old_value, dict) and isinstance(new_value, dict):
+            old_value = _deref(old_value, defs_old, set())
+            new_value = _deref(new_value, defs_new, set())
         old_type, new_type = old_value.get("type"), new_value.get("type")
         if old_type is None and new_type is not None:
             changes.append(_change("input-restricted", "breaking", property_path, f"input {field!r} gained a type constraint"))
@@ -54,6 +110,21 @@ def _compare_schema(old: dict[str, Any], new: dict[str, Any], path: str) -> list
             changes.append(_change("input-restricted", "breaking", property_path, f"input {field!r} gained a const constraint"))
         elif "const" in old_value and "const" in new_value and old_value.get("const") != new_value.get("const"):
             changes.append(_change("const-changed", "breaking", property_path, f"input {field!r} const changed"))
+        for keyword in _RESTRICTING_KEYWORDS:
+            if keyword not in old_value and keyword in new_value:
+                changes.append(_change("input-restricted", "breaking", property_path, f"input {field!r} gained a {keyword} constraint"))
+        if isinstance(old_value.get("properties"), dict) or isinstance(new_value.get("properties"), dict):
+            changes.extend(
+                _compare_schema(
+                    old_value,
+                    new_value,
+                    property_path,
+                    defs_old=defs_old,
+                    defs_new=defs_new,
+                    depth=depth + 1,
+                    seen=seen,
+                )
+            )
     for field in sorted(new_properties.keys() - old_properties.keys() - new_required):
         changes.append(_change("input-added", "non-breaking", f"{path}.properties.{field}", f"optional input {field!r} was added"))
     return changes
