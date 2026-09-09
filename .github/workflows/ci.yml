@@ -28,6 +28,24 @@ jobs:
       - name: Run real stdio MCP demo
         run: bash demo/run_demo.sh "$RUNNER_TEMP/mcp-shipcheck-demo"
 
+  package:
+    name: Build and validate release artifacts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14"
+      - name: Build wheel and source distribution
+        run: |
+          python -m pip install build
+          python -m build
+      - name: Validate wheel contents and installed CLI
+        run: |
+          python -m pip install dist/*.whl
+          mcp-shipcheck --help
+          python -m unittest discover -s tests -v
+
   test-windows:
     name: Python 3.14 / windows-latest
     runs-on: windows-latest
