@@ -36,6 +36,26 @@ _RESTRICTING_KEYWORDS = (
     "minimum",
     "maximum",
 )
+_LOWER_BOUND_KEYWORDS = {"minLength", "minItems", "minimum"}
+_UPPER_BOUND_KEYWORDS = {"maxLength", "maxItems", "maximum"}
+
+
+def _constraint_tightened(keyword: str, old: Any, new: Any) -> bool:
+    if old == new:
+        return False
+    if keyword == "pattern":
+        # Different regular expressions are not safely orderable. Treat a
+        # replacement as potentially narrowing the accepted input set.
+        return True
+    if not isinstance(old, (int, float)) or isinstance(old, bool):
+        return True
+    if not isinstance(new, (int, float)) or isinstance(new, bool):
+        return True
+    if keyword in _LOWER_BOUND_KEYWORDS:
+        return new > old
+    if keyword in _UPPER_BOUND_KEYWORDS:
+        return new < old
+    return True
 
 
 def _local_defs(schema: dict[str, Any]) -> dict[str, Any]:
@@ -123,6 +143,17 @@ def _compare_schema(
         for keyword in _RESTRICTING_KEYWORDS:
             if keyword not in old_value and keyword in new_value:
                 changes.append(_change("input-restricted", "breaking", property_path, f"input {field!r} gained a {keyword} constraint"))
+            elif keyword in old_value and keyword in new_value and _constraint_tightened(
+                keyword, old_value[keyword], new_value[keyword]
+            ):
+                changes.append(
+                    _change(
+                        "input-restricted",
+                        "breaking",
+                        property_path,
+                        f"input {field!r} tightened its {keyword} constraint",
+                    )
+                )
 
         if isinstance(old_value.get("properties"), dict) or isinstance(new_value.get("properties"), dict):
             changes.extend(
