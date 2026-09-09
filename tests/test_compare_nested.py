@@ -118,6 +118,70 @@ class NestedConstraintCompareTests(unittest.TestCase):
             2,
         )
 
+    def test_tightening_existing_bounds_is_breaking(self) -> None:
+        baseline = self._snapshot(
+            {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "minLength": 2, "maxLength": 20},
+                    "count": {"type": "integer", "minimum": 0, "maximum": 100},
+                },
+            }
+        )
+        candidate = self._snapshot(
+            {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "minLength": 4, "maxLength": 10},
+                    "count": {"type": "integer", "minimum": 5, "maximum": 50},
+                },
+            }
+        )
+        result = compare_snapshots(baseline, candidate)
+        self.assertFalse(result["compatible"])
+        self.assertEqual(
+            4,
+            sum(change["kind"] == "input-restricted" for change in result["changes"]),
+        )
+
+    def test_relaxing_existing_bounds_remains_compatible(self) -> None:
+        baseline = self._snapshot(
+            {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "minLength": 4, "maxLength": 10},
+                    "count": {"type": "integer", "minimum": 5, "maximum": 50},
+                },
+            }
+        )
+        candidate = self._snapshot(
+            {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "minLength": 2, "maxLength": 20},
+                    "count": {"type": "integer", "minimum": 0, "maximum": 100},
+                },
+            }
+        )
+        self.assertTrue(compare_snapshots(baseline, candidate)["compatible"])
+
+    def test_changed_pattern_is_treated_as_breaking(self) -> None:
+        baseline = self._snapshot(
+            {
+                "type": "object",
+                "properties": {"mode": {"type": "string", "pattern": "^[a-z]+$"}},
+            }
+        )
+        candidate = self._snapshot(
+            {
+                "type": "object",
+                "properties": {"mode": {"type": "string", "pattern": "^[a-z0-9]+$"}},
+            }
+        )
+        result = compare_snapshots(baseline, candidate)
+        self.assertFalse(result["compatible"])
+        self.assertIn("input-restricted", {change["kind"] for change in result["changes"]})
+
     def test_relaxation_and_property_order_remain_compatible(self) -> None:
         baseline = self._snapshot(
             {
