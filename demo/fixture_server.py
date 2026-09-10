@@ -30,6 +30,7 @@ MODES = [
     "huge-line",
     "non-utf8",
     "int-name",
+    "interleaved-notification",
 ]
 
 
@@ -120,6 +121,14 @@ def main() -> int:
                 )
                 sys.stdout.flush()
                 continue
+            if args.mode == "interleaved-notification":
+                reply(
+                    {
+                        "jsonrpc": "2.0",
+                        "method": "notifications/message",
+                        "params": {"level": "info", "data": "warming up"},
+                    }
+                )
             protocol = "99.99.99" if args.mode == "wrong-protocol" else "2024-11-05"
             reply(
                 {
@@ -144,6 +153,14 @@ def main() -> int:
             elif args.mode == "missing-tools":
                 reply({"jsonrpc": "2.0", "id": request_id, "result": {}})
             else:
+                if args.mode == "interleaved-notification":
+                    reply(
+                        {
+                            "jsonrpc": "2.0",
+                            "method": "notifications/message",
+                            "params": {"level": "debug", "data": "listing tools"},
+                        }
+                    )
                 reply({"jsonrpc": "2.0", "id": request_id, "result": {"tools": toolset(args.mode)}})
         elif method == "tools/call":
             reply(
