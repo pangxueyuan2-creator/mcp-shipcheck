@@ -139,22 +139,36 @@ def _request(
 ) -> dict[str, Any]:
     process = server.process
     _write(process, {"jsonrpc": "2.0", "id": request_id, "method": method, "params": params})
-    raw = _readline(server, timeout)
-    try:
-        response = json.loads(raw)
-    except json.JSONDecodeError as exc:
-        raise ProtocolError(f"server wrote non-JSON output to stdout: {raw[:160].strip()!r}") from exc
-    if not isinstance(response, dict) or response.get("jsonrpc") != "2.0":
-        raise ProtocolError("server response is not a JSON-RPC 2.0 object")
-    if response.get("id") != request_id:
-        raise ProtocolError(f"server response id {response.get('id')!r} does not match request id {request_id}")
-    if "error" in response:
-        error = response["error"]
-        message = error.get("message", "unknown error") if isinstance(error, dict) else str(error)
-        raise ProtocolError(f"{method} returned JSON-RPC error: {message}")
-    if "result" not in response or not isinstance(response["result"], dict):
-        raise ProtocolError(f"{method} returned no object result")
-    return response["result"]
+    deadline = time.monotonic() + timeout
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise ProbeTimeout(f"no JSON-RPC response within {timeout:.2f}s")
+        raw = _readline(server, remaining)
+        try:
+            response = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise ProtocolError(
+                f"server wrote non-JSON output to stdout: {raw[:160].strip()!r}"
+            ) from exc
+        if not isinstance(response, dict) or response.get("jsonrpc") != "2.0":
+            raise ProtocolError("server response is not a JSON-RPC 2.0 object")
+        if "id" not in response and "method" in response:
+            notification_method = response.get("method")
+            if not isinstance(notification_method, str) or not notification_method:
+                raise ProtocolError("server notification has an invalid method")
+            continue
+        if response.get("id") != request_id:
+            raise ProtocolError(
+                f"server response id {response.get('id')!r} does not match request id {request_id}"
+            )
+        if "error" in response:
+            error = response["error"]
+            message = error.get("message", "unknown error") if isinstance(error, dict) else str(error)
+            raise ProtocolError(f"{method} returned JSON-RPC error: {message}")
+        if "result" not in response or not isinstance(response["result"], dict):
+            raise ProtocolError(f"{method} returned no object result")
+        return response["result"]
 
 
 def _normalize_tool(tool: dict[str, Any]) -> dict[str, Any]:
