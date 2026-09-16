@@ -1,0 +1,4 @@
+recursive-include tests *.py
+recursive-include demo *.py *.sh
+recursive-include docs *.md
+include CONTRIBUTING.md SECURITY.md

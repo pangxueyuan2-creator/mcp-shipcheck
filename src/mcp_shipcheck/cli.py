@@ -68,7 +68,10 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="subcommand", required=True)
 
     verify = subparsers.add_parser("verify", help="start a server, initialize it, and snapshot tools/list")
-    verify.add_argument("--timeout", type=float, default=5.0, help="per-request timeout in seconds (default: 5)")
+    verify.add_argument(
+        "--timeout", type=float, default=5.0,
+        help="timeout for initialization and separately for the complete tool listing (default: 5s)",
+    )
     verify.add_argument("--output", required=True, help="path for the generated snapshot JSON")
     verify.add_argument("--baseline", help="optional prior snapshot; exits 2 for breaking changes")
     verify.add_argument("--compare-output", help="optional path for the comparison JSON")
