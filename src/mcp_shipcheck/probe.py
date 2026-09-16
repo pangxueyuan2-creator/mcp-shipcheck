@@ -7,6 +7,7 @@ JSON-RPC initialization, and the public tools/list surface.
 from __future__ import annotations
 
 import json
+import math
 import os
 import queue
 import subprocess
@@ -19,6 +20,9 @@ from typing import Any, Iterable
 PROTOCOL_VERSION = "2024-11-05"
 SUPPORTED_PROTOCOL_VERSIONS = frozenset({PROTOCOL_VERSION})
 MAX_JSONRPC_LINE = 1_048_576
+MAX_TOOL_PAGES = 100
+MAX_TOOLS = 10_000
+MAX_TOOL_RESULT_BYTES = 16 * 1_048_576
 
 
 class ShipcheckError(RuntimeError):
@@ -124,22 +128,43 @@ def _readline(server: _ServerProcess, timeout: float) -> str:
         leftover.extend(chunk)
 
 
-def _write(process: subprocess.Popen[bytes], payload: dict[str, Any]) -> None:
+def _write(process: subprocess.Popen[bytes], payload: dict[str, Any], timeout: float) -> None:
     if process.stdin is None:
         raise StartupError("server stdin is unavailable")
+    stream = process.stdin
+    data = (json.dumps(payload, separators=(",", ":")) + "\n").encode("utf-8")
+    completed: queue.Queue[bool] = queue.Queue(maxsize=1)
+
+    def writer() -> None:
+        try:
+            pending = memoryview(data)
+            while pending:
+                written = stream.write(pending)
+                if not written:
+                    raise OSError("server stdin did not accept data")
+                pending = pending[written:]
+            stream.flush()
+            completed.put(True)
+        except (OSError, ValueError):
+            completed.put(False)
+
+    # A returned opaque cursor can be larger than the pipe buffer. A server
+    # that stops reading must not defeat the catalog deadline with a blocked write.
+    threading.Thread(target=writer, daemon=True).start()
     try:
-        process.stdin.write((json.dumps(payload, separators=(",", ":")) + "\n").encode("utf-8"))
-        process.stdin.flush()
-    except (BrokenPipeError, OSError) as exc:
-        raise StartupError(f"could not write to server: {exc}") from exc
+        success = completed.get(timeout=timeout)
+    except queue.Empty:
+        raise ProbeTimeout("server did not read the JSON-RPC request before the deadline") from None
+    if not success:
+        raise StartupError("could not write to server")
 
 
 def _request(
     server: _ServerProcess, request_id: int, method: str, params: dict[str, Any], timeout: float
 ) -> dict[str, Any]:
     process = server.process
-    _write(process, {"jsonrpc": "2.0", "id": request_id, "method": method, "params": params})
     deadline = time.monotonic() + timeout
+    _write(process, {"jsonrpc": "2.0", "id": request_id, "method": method, "params": params}, timeout)
     while True:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
@@ -147,10 +172,9 @@ def _request(
         raw = _readline(server, remaining)
         try:
             response = json.loads(raw)
-        except json.JSONDecodeError as exc:
-            raise ProtocolError(
-                f"server wrote non-JSON output to stdout: {raw[:160].strip()!r}"
-            ) from exc
+        except json.JSONDecodeError:
+            # Server output may contain opaque cursors or credentials.
+            raise ProtocolError("server wrote non-JSON output to stdout") from None
         if not isinstance(response, dict) or response.get("jsonrpc") != "2.0":
             raise ProtocolError("server response is not a JSON-RPC 2.0 object")
         if "id" not in response and "method" in response:
@@ -159,13 +183,9 @@ def _request(
                 raise ProtocolError("server notification has an invalid method")
             continue
         if response.get("id") != request_id:
-            raise ProtocolError(
-                f"server response id {response.get('id')!r} does not match request id {request_id}"
-            )
+            raise ProtocolError("server response id does not match request id")
         if "error" in response:
-            error = response["error"]
-            message = error.get("message", "unknown error") if isinstance(error, dict) else str(error)
-            raise ProtocolError(f"{method} returned JSON-RPC error: {message}")
+            raise ProtocolError(f"{method} returned JSON-RPC error")
         if "result" not in response or not isinstance(response["result"], dict):
             raise ProtocolError(f"{method} returned no object result")
         return response["result"]
@@ -182,6 +202,51 @@ def _normalize_tool(tool: dict[str, Any]) -> dict[str, Any]:
     return normalized
 
 
+def _list_tools(server: _ServerProcess, timeout: float) -> list[dict[str, Any]]:
+    """Collect a complete catalog, or fail without returning a partial surface.
+
+    The timeout covers the entire listing, not each page independently. Cursors
+    remain opaque and in memory only; even an empty cursor requests another page.
+    """
+    deadline = time.monotonic() + timeout
+    params: dict[str, Any] = {}
+    cursors: set[str] = set()
+    names: set[str] = set()
+    tools: list[dict[str, Any]] = []
+    result_bytes = 0
+    for page in range(MAX_TOOL_PAGES):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise ProbeTimeout("tools/list exceeded the catalog timeout")
+        result = _request(server, page + 2, "tools/list", params, remaining)
+        result_bytes += len(json.dumps(result, ensure_ascii=True).encode("utf-8"))
+        if result_bytes > MAX_TOOL_RESULT_BYTES:
+            raise ProtocolError("tools/list exceeds the catalog byte limit")
+        raw_tools = result.get("tools")
+        if not isinstance(raw_tools, list) or not all(isinstance(tool, dict) for tool in raw_tools):
+            raise ProtocolError("tools/list result has no tools array")
+        if len(tools) + len(raw_tools) > MAX_TOOLS:
+            raise ProtocolError("tools/list exceeds the tool count limit")
+        for tool in raw_tools:
+            name = tool.get("name")
+            if not isinstance(name, str) or not name.strip():
+                raise ProtocolError("tools/list contains a tool without a non-empty string name")
+            if name in names:
+                raise ProtocolError("tools/list contains duplicate tool names")
+            names.add(name)
+            tools.append(_normalize_tool(tool))
+        if "nextCursor" not in result:
+            return sorted(tools, key=lambda tool: tool["name"])
+        cursor = result["nextCursor"]
+        if not isinstance(cursor, str):
+            raise ProtocolError("tools/list nextCursor must be a string when present")
+        if cursor in cursors:
+            raise ProtocolError("tools/list contains a repeated pagination cursor")
+        cursors.add(cursor)
+        params = {"cursor": cursor}
+    raise ProtocolError("tools/list exceeds the page count limit")
+
+
 def probe_command(command: Iterable[str], timeout: float = 5.0) -> dict[str, Any]:
     """Probe a stdio MCP server and return a JSON-serializable release snapshot.
 
@@ -190,6 +255,10 @@ def probe_command(command: Iterable[str], timeout: float = 5.0) -> dict[str, Any
     values, request arguments, or tool outputs are captured. Server stderr is
     discarded and is never included in probe errors.
     """
+    if isinstance(timeout, bool) or not isinstance(timeout, (int, float)):
+        raise ValueError("timeout must be a finite positive number")
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise ValueError("timeout must be a finite positive number")
     argv = list(command)
     if argv[:1] == ["--"]:
         argv = argv[1:]
@@ -229,21 +298,9 @@ def probe_command(command: Iterable[str], timeout: float = 5.0) -> dict[str, Any
         _write(
             process,
             {"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}},
+            timeout,
         )
-        tools_result = _request(server, 2, "tools/list", {}, timeout)
-        if "tools" not in tools_result:
-            raise ProtocolError("tools/list result has no tools array")
-        raw_tools = tools_result.get("tools")
-        if not isinstance(raw_tools, list) or not all(isinstance(tool, dict) for tool in raw_tools):
-            raise ProtocolError("tools/list result has no tools array")
-        for tool in raw_tools:
-            name = tool.get("name")
-            if not isinstance(name, str) or not name.strip():
-                raise ProtocolError("tools/list contains a tool without a non-empty string name")
-        names = [tool["name"] for tool in raw_tools]
-        if len(names) != len(set(names)):
-            raise ProtocolError("tools/list contains duplicate tool names")
-        tools = sorted((_normalize_tool(tool) for tool in raw_tools), key=lambda tool: tool["name"])
+        tools = _list_tools(server, timeout)
         elapsed_ms = round((time.monotonic() - started) * 1000)
         return {
             "format": "mcp-shipcheck/v1",

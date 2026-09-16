@@ -4,7 +4,7 @@
 
 MCP ShipCheck starts an explicitly supplied **stdio** MCP server command, sends only `initialize` and `tools/list`, and writes a safe release snapshot. In CI, it compares that snapshot to a trusted baseline and exits non-zero when a public tool contract breaks.
 
-> It never executes `tools/call`. It never records tool arguments, environment variables, tool output, or stderr.
+> It never executes `tools/call`. It never records tool arguments, environment variables, tool output, stderr, or pagination cursors.
 
 This is not a full MCP test framework or a security scanner. It is the small release gate between “tests passed in the repository” and “the package your user installs still starts and exposes a compatible tool surface.”
 
@@ -41,7 +41,17 @@ A source-tree unit test cannot catch a package that forgot to ship an environmen
 
 ShipCheck reports a breaking change when it observes a removed tool, removed input, newly required input, input type change, narrowed `enum`, changed `const`, protocol-version change, or server-capability change. A newly added tool or optional input is reported as non-breaking. Description-only changes are intentionally ignored.
 
-Snapshot JSON is deterministic except for the observation timestamp and probe duration. It contains server info, capabilities, tool names, descriptions and input schemas. It does **not** contain requests beyond the two fixed protocol requests, tool call inputs, tool results, environment variables, or server stderr.
+Snapshot JSON is deterministic except for the observation timestamp and probe duration. It contains server info, capabilities, tool names, descriptions and input schemas. It does **not** contain tool call inputs, tool results, environment variables, pagination cursors, or server stderr. The probe sends `initialize`, `notifications/initialized`, and as many `tools/list` requests as needed within the bounds below.
+
+### Complete paginated tool catalogs
+
+ShipCheck follows opaque `nextCursor` values, including empty strings, until the server omits the cursor. It merges every page into a single sorted catalog before writing a candidate snapshot or comparing contracts. This catches a removed or changed tool even when it appears after the first page. See the supported [MCP 2024-11-05 pagination protocol](https://modelcontextprotocol.io/specification/2024-11-05/server/utilities/pagination).
+
+The probe rejects repeated cursors, duplicate tool names (including across pages), malformed pages, and later-page errors. It limits a catalog to 100 pages, 10,000 tools, and 16 MiB of re-encoded JSON result data; each stdout line is limited to 1 MiB. Exceeding a limit exits `1` without writing a partial candidate snapshot. An existing output file is left unchanged on probe failure, so callers must honor the exit code rather than reuse stale output.
+
+`--timeout` must be finite and positive. It applies once to initialization and separately to the **entire** tool listing, including all pages and interleaved notifications. It is not renewed for every page. Increase it explicitly for servers with large catalogs.
+
+The `mcp-shipcheck/v1` snapshot shape is unchanged. **Regenerate trusted baselines previously collected from paginated servers:** older versions captured only page one, and an old snapshot cannot prove whether additional pages existed. Unpaginated baselines continue to work.
 
 ## Full local demo
 
@@ -77,7 +87,7 @@ PatchWitness validates a code change’s scope, policies, checks, secrets and ev
 
 ## Known limitations
 
-MVP supports only local stdio JSON-RPC and only the `initialize`/`tools/list` release surface. It does not test remote Streamable HTTP/SSE transports, resources/prompts, pagination, authentication, stateful tool behavior, or full JSON Schema semantics. It cannot prove that a tool is secure or semantically correct; it proves only that the specified server process starts and has a compatible observed handshake/tool contract. Some server commands have startup side effects; execute untrusted commands only in an isolated environment.
+MVP supports only local stdio JSON-RPC and only the `initialize`/`tools/list` release surface, using protocol version `2024-11-05`. It does not test remote Streamable HTTP/SSE transports, resources/prompts, authentication, stateful tool behavior, or full JSON Schema semantics. It cannot prove that a tool is secure or semantically correct; it proves only that the specified server process starts and has a compatible observed handshake/tool contract. Some server commands have startup side effects; execute untrusted commands only in an isolated environment.
 
 ## Development
 
