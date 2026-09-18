@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from math import isfinite
 from typing import Any
 
 
@@ -100,6 +101,58 @@ def _type_set(value: Any) -> frozenset[str] | None:
     return None
 
 
+def _json_value_identity(value: Any) -> tuple[Any, ...] | None:
+    """Return JSON Schema equality identity without Python bool/int aliasing.
+
+    JSON Schema treats booleans as a different primitive type from numbers,
+    while numerically equal JSON numbers such as ``1`` and ``1.0`` compare as
+    the same value. Containers are compared recursively and object key order is
+    irrelevant.
+    """
+
+    if value is None:
+        return ("null",)
+    if isinstance(value, bool):
+        return ("boolean", value)
+    if isinstance(value, (int, float)):
+        if isinstance(value, float) and not isfinite(value):
+            return None
+        return ("number", value)
+    if isinstance(value, str):
+        return ("string", value)
+    if isinstance(value, list):
+        items: list[tuple[Any, ...]] = []
+        for item in value:
+            identity = _json_value_identity(item)
+            if identity is None:
+                return None
+            items.append(identity)
+        return ("array", tuple(items))
+    if isinstance(value, dict):
+        items: list[tuple[str, tuple[Any, ...]]] = []
+        for key in sorted(value):
+            if not isinstance(key, str):
+                return None
+            identity = _json_value_identity(value[key])
+            if identity is None:
+                return None
+            items.append((key, identity))
+        return ("object", tuple(items))
+    return None
+
+
+def _enum_identities(value: Any) -> list[tuple[Any, ...]] | None:
+    if not isinstance(value, list):
+        return None
+    identities: list[tuple[Any, ...]] = []
+    for item in value:
+        identity = _json_value_identity(item)
+        if identity is None:
+            return None
+        identities.append(identity)
+    return identities
+
+
 def _compare_type_constraint(old: dict[str, Any], new: dict[str, Any], path: str) -> list[dict[str, str]]:
     """Classify JSON Schema type changes by accepted-type set inclusion."""
     old_present = "type" in old
@@ -137,6 +190,47 @@ def _compare_type_constraint(old: dict[str, Any], new: dict[str, Any], path: str
             f"input schema no longer accepts all prior types {sorted(old_types)!r}",
         )
     ]
+
+
+def _compare_literal_constraints(old: dict[str, Any], new: dict[str, Any], path: str) -> list[dict[str, str]]:
+    """Classify ``enum`` and ``const`` changes using JSON Schema value equality."""
+
+    changes: list[dict[str, str]] = []
+    old_enum_present = "enum" in old
+    new_enum_present = "enum" in new
+    old_enum = old.get("enum")
+    new_enum = new.get("enum")
+
+    if not old_enum_present and new_enum_present:
+        changes.append(_change("input-restricted", "breaking", path, "input schema gained an enum constraint"))
+    elif old_enum_present and new_enum_present:
+        old_ids = _enum_identities(old_enum)
+        new_ids = _enum_identities(new_enum)
+        if old_ids is None or new_ids is None:
+            if old_enum != new_enum:
+                changes.append(_change("enum-changed", "breaking", path, "input schema changed its enum constraint"))
+        else:
+            new_id_set = set(new_ids)
+            removed = [value for value, identity in zip(old_enum, old_ids, strict=True) if identity not in new_id_set]
+            if removed:
+                changes.append(
+                    _change("enum-narrowed", "breaking", path, f"input schema no longer accepts {removed!r}")
+                )
+
+    old_const_present = "const" in old
+    new_const_present = "const" in new
+    if not old_const_present and new_const_present:
+        changes.append(_change("input-restricted", "breaking", path, "input schema gained a const constraint"))
+    elif old_const_present and new_const_present:
+        old_identity = _json_value_identity(old.get("const"))
+        new_identity = _json_value_identity(new.get("const"))
+        if old_identity is None or new_identity is None:
+            if old.get("const") != new.get("const"):
+                changes.append(_change("const-changed", "breaking", path, "input schema const changed"))
+        elif old_identity != new_identity:
+            changes.append(_change("const-changed", "breaking", path, "input schema const changed"))
+
+    return changes
 
 
 def _compare_composition_constraints(old: dict[str, Any], new: dict[str, Any], path: str) -> list[dict[str, str]]:
@@ -206,6 +300,7 @@ def _compare_schema(
     seen.add(pair)
 
     changes.extend(_compare_type_constraint(old, new, path))
+    changes.extend(_compare_literal_constraints(old, new, path))
     changes.extend(_compare_composition_constraints(old, new, path))
 
     old_required, new_required = _required(old), _required(new)
@@ -222,19 +317,6 @@ def _compare_schema(
         old_value = _deref(old_properties[field], defs_old)
         new_value = _deref(new_properties[field], defs_new)
 
-        old_enum, new_enum = old_value.get("enum"), new_value.get("enum")
-        if old_enum is None and isinstance(new_enum, list):
-            changes.append(_change("input-restricted", "breaking", property_path, f"input {field!r} gained an enum constraint"))
-        elif isinstance(old_enum, list) and isinstance(new_enum, list):
-            removed = [value for value in old_enum if value not in new_enum]
-            if removed:
-                changes.append(_change("enum-narrowed", "breaking", property_path, f"input {field!r} no longer accepts {removed!r}"))
-
-        if "const" not in old_value and "const" in new_value:
-            changes.append(_change("input-restricted", "breaking", property_path, f"input {field!r} gained a const constraint"))
-        elif "const" in old_value and "const" in new_value and old_value.get("const") != new_value.get("const"):
-            changes.append(_change("const-changed", "breaking", property_path, f"input {field!r} const changed"))
-
         for keyword in _RESTRICTING_KEYWORDS:
             if keyword not in old_value and keyword in new_value:
                 changes.append(_change("input-restricted", "breaking", property_path, f"input {field!r} gained a {keyword} constraint"))
@@ -250,9 +332,9 @@ def _compare_schema(
                     )
                 )
 
-        # Recurse through all existing property pairs so type/composition
-        # keywords are checked even on primitive properties and behind local
-        # $defs refs.
+        # Recurse through all existing property pairs so type, literal and
+        # composition keywords are checked even on primitive properties and
+        # behind local $defs refs.
         changes.extend(
             _compare_schema(
                 old_value,
@@ -274,9 +356,9 @@ def compare_snapshots(baseline: dict[str, Any], candidate: dict[str, Any]) -> di
     """Compare two snapshots and classify public tool-surface changes.
 
     A comparison is breaking when a tool disappears, a required input is added,
-    an input is removed or narrows its accepted type set, an enum is narrowed, a
-    supported schema constraint becomes stricter, or protocol/server capabilities
-    change. Tool descriptions deliberately do not affect the result.
+    an input is removed or narrows its accepted type/literal set, a supported
+    schema constraint becomes stricter, or protocol/server capabilities change.
+    Tool descriptions deliberately do not affect the result.
     """
     changes: list[dict[str, str]] = []
     baseline_tools, candidate_tools = _tools(baseline), _tools(candidate)
