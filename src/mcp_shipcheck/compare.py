@@ -272,6 +272,89 @@ def _compare_composition_constraints(old: dict[str, Any], new: dict[str, Any], p
     return changes
 
 
+def _additional_properties_mode(schema: dict[str, Any]) -> tuple[str, Any]:
+    """Normalize ``additionalProperties`` with JSON Schema's default-open semantics."""
+    if "additionalProperties" not in schema:
+        return ("allow", True)
+    value = schema.get("additionalProperties")
+    if value is True:
+        return ("allow", True)
+    if value is False:
+        return ("deny", False)
+    if isinstance(value, dict):
+        return ("schema", value)
+    return ("invalid", value)
+
+
+def _compare_additional_properties(old: dict[str, Any], new: dict[str, Any], path: str) -> list[dict[str, str]]:
+    """Detect object-schema changes that reject previously accepted extra keys.
+
+    Missing ``additionalProperties`` is equivalent to ``true``. Schema-valued
+    changes are intentionally conservative: an empty schema remains equivalent
+    to allowing extras, while a new or changed non-empty schema is considered a
+    restriction unless the old schema denied extras entirely.
+    """
+    old_mode, old_value = _additional_properties_mode(old)
+    new_mode, new_value = _additional_properties_mode(new)
+    keyword_path = f"{path}.additionalProperties"
+
+    if old_mode == new_mode and old_value == new_value:
+        return []
+
+    # Once extra keys were forbidden, allowing all extras or allowing a subset
+    # cannot reject any object that previously validated.
+    if old_mode == "deny" and new_mode in {"allow", "schema"}:
+        return []
+    if new_mode == "allow":
+        return []
+
+    # ``{}`` accepts every value, so it is equivalent to ``true`` for the
+    # additional-property values it evaluates.
+    if old_mode == "allow" and new_mode == "schema" and new_value == {}:
+        return []
+    if old_mode == "schema" and old_value == {} and new_mode == "allow":
+        return []
+
+    if old_mode == "invalid" or new_mode == "invalid":
+        return [
+            _change(
+                "additional-properties-changed",
+                "breaking",
+                keyword_path,
+                "input schema changed an unsupported additionalProperties form",
+            )
+        ]
+
+    if old_mode == "allow" and new_mode in {"deny", "schema"}:
+        return [
+            _change(
+                "additional-properties-restricted",
+                "breaking",
+                keyword_path,
+                "input schema no longer accepts all additional object properties",
+            )
+        ]
+    if old_mode == "schema" and new_mode == "deny":
+        return [
+            _change(
+                "additional-properties-restricted",
+                "breaking",
+                keyword_path,
+                "input schema no longer accepts additional object properties allowed by the prior schema",
+            )
+        ]
+    if old_mode == "schema" and new_mode == "schema":
+        return [
+            _change(
+                "additional-properties-changed",
+                "breaking",
+                keyword_path,
+                "input schema changed the contract for additional object properties",
+            )
+        ]
+    return []
+
+
 def _compare_schema(
     old: dict[str, Any],
     new: dict[str, Any],
@@ -302,6 +385,7 @@ def _compare_schema(
     changes.extend(_compare_type_constraint(old, new, path))
     changes.extend(_compare_literal_constraints(old, new, path))
     changes.extend(_compare_composition_constraints(old, new, path))
+    changes.extend(_compare_additional_properties(old, new, path))
 
     old_required, new_required = _required(old), _required(new)
     for field in sorted(new_required - old_required):
@@ -332,9 +416,9 @@ def _compare_schema(
                     )
                 )
 
-        # Recurse through all existing property pairs so type, literal and
-        # composition keywords are checked even on primitive properties and
-        # behind local $defs refs.
+        # Recurse through all existing property pairs so type, literal,
+        # composition, and object-openness keywords are checked even on
+        # primitive properties and behind local $defs refs.
         changes.extend(
             _compare_schema(
                 old_value,
@@ -357,8 +441,9 @@ def compare_snapshots(baseline: dict[str, Any], candidate: dict[str, Any]) -> di
 
     A comparison is breaking when a tool disappears, a required input is added,
     an input is removed or narrows its accepted type/literal set, a supported
-    schema constraint becomes stricter, or protocol/server capabilities change.
-    Tool descriptions deliberately do not affect the result.
+    schema constraint becomes stricter, object openness is narrowed, or
+    protocol/server capabilities change. Tool descriptions deliberately do not
+    affect the result.
     """
     changes: list[dict[str, str]] = []
     baseline_tools, candidate_tools = _tools(baseline), _tools(candidate)
