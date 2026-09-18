@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 
@@ -38,6 +39,7 @@ _RESTRICTING_KEYWORDS = (
 )
 _LOWER_BOUND_KEYWORDS = {"minLength", "minItems", "minimum"}
 _UPPER_BOUND_KEYWORDS = {"maxLength", "maxItems", "maximum"}
+_COMPOSITION_KEYWORDS = ("anyOf", "oneOf")
 
 
 def _constraint_tightened(keyword: str, old: Any, new: Any) -> bool:
@@ -80,6 +82,54 @@ def _deref(schema: dict[str, Any], defs: dict[str, Any]) -> dict[str, Any]:
     return current
 
 
+def _composition_branch_keys(value: Any) -> list[str] | None:
+    if not isinstance(value, list):
+        return None
+    try:
+        return [json.dumps(branch, sort_keys=True, separators=(",", ":"), ensure_ascii=False) for branch in value]
+    except (TypeError, ValueError):
+        return None
+
+
+def _compare_composition_constraints(old: dict[str, Any], new: dict[str, Any], path: str) -> list[dict[str, str]]:
+    """Conservatively classify supported ``anyOf``/``oneOf`` changes."""
+    changes: list[dict[str, str]] = []
+    for keyword in _COMPOSITION_KEYWORDS:
+        old_present = keyword in old
+        new_present = keyword in new
+        old_value = old.get(keyword)
+        new_value = new.get(keyword)
+        old_keys = _composition_branch_keys(old_value)
+        new_keys = _composition_branch_keys(new_value)
+        keyword_path = f"{path}.{keyword}"
+
+        if not old_present and new_present:
+            changes.append(_change("input-restricted", "breaking", keyword_path, f"input schema gained a {keyword} constraint"))
+            continue
+        if old_present and not new_present:
+            continue
+        if not old_present or not new_present or old_value == new_value:
+            continue
+        if old_keys is None or new_keys is None:
+            changes.append(_change("input-restricted", "breaking", keyword_path, f"input schema changed its {keyword} constraint"))
+            continue
+
+        if keyword == "anyOf":
+            # Keeping every old branch and adding alternatives cannot reject an
+            # input that previously matched at least one branch.
+            if set(old_keys).issubset(set(new_keys)):
+                continue
+            changes.append(_change("input-restricted", "breaking", keyword_path, "input schema removed or changed an anyOf alternative"))
+            continue
+
+        # oneOf requires exactly one matching branch. Only pure reordering of
+        # the same branch multiset is provably safe without semantic reasoning.
+        if sorted(old_keys) != sorted(new_keys):
+            changes.append(_change("input-restricted", "breaking", keyword_path, "input schema changed oneOf alternatives; exclusivity may narrow accepted input"))
+
+    return changes
+
+
 def _compare_schema(
     old: dict[str, Any],
     new: dict[str, Any],
@@ -106,6 +156,8 @@ def _compare_schema(
     if pair in seen:
         return changes
     seen.add(pair)
+
+    changes.extend(_compare_composition_constraints(old, new, path))
 
     old_required, new_required = _required(old), _required(new)
     for field in sorted(new_required - old_required):
@@ -155,18 +207,19 @@ def _compare_schema(
                     )
                 )
 
-        if isinstance(old_value.get("properties"), dict) or isinstance(new_value.get("properties"), dict):
-            changes.extend(
-                _compare_schema(
-                    old_value,
-                    new_value,
-                    property_path,
-                    defs_old=defs_old,
-                    defs_new=defs_new,
-                    depth=depth + 1,
-                    seen=seen,
-                )
+        # Recurse through all existing property pairs so composition keywords
+        # are checked even on primitive properties and behind local $defs refs.
+        changes.extend(
+            _compare_schema(
+                old_value,
+                new_value,
+                property_path,
+                defs_old=defs_old,
+                defs_new=defs_new,
+                depth=depth + 1,
+                seen=seen,
             )
+        )
 
     for field in sorted(new_properties.keys() - old_properties.keys() - new_required):
         changes.append(_change("input-added", "non-breaking", f"{path}.properties.{field}", f"optional input {field!r} was added"))
@@ -177,8 +230,9 @@ def compare_snapshots(baseline: dict[str, Any], candidate: dict[str, Any]) -> di
     """Compare two snapshots and classify public tool-surface changes.
 
     A comparison is breaking when a tool disappears, a required input is added,
-    an input is removed or changes type, an enum is narrowed, or protocol/server
-    capabilities change. Tool descriptions deliberately do not affect the result.
+    an input is removed or changes type, an enum is narrowed, a supported schema
+    constraint becomes stricter, or protocol/server capabilities change. Tool
+    descriptions deliberately do not affect the result.
     """
     changes: list[dict[str, str]] = []
     baseline_tools, candidate_tools = _tools(baseline), _tools(candidate)
