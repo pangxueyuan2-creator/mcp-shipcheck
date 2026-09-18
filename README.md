@@ -39,7 +39,7 @@ A source-tree unit test cannot catch a package that forgot to ship an environmen
 
 ## What counts as breaking
 
-ShipCheck reports a breaking change when it observes a removed tool, removed input, newly required input, input type change, narrowed `enum`, changed `const`, protocol-version change, or server-capability change. A newly added tool or optional input is reported as non-breaking. Description-only changes are intentionally ignored.
+ShipCheck reports a breaking change when it observes a removed tool, removed input, newly required input, a narrowed input type set, narrowed `enum`, changed `const`, protocol-version change, or server-capability change. JSON Schema `type` arrays are compared by accepted-type set: widening `"string"` to `["string", "null"]` is non-breaking, narrowing that union back to `"string"` is breaking, and pure type-array reordering is ignored. A newly added tool or optional input is reported as non-breaking. Description-only changes are intentionally ignored. See [`docs/schema-types.md`](docs/schema-types.md) and [`docs/schema-composition.md`](docs/schema-composition.md) for the bounded schema rules.
 
 Snapshot JSON is deterministic except for the observation timestamp and probe duration. It contains server info, capabilities, tool names, descriptions and input schemas. It does **not** contain tool call inputs, tool results, environment variables, pagination cursors, or server stderr. The probe sends `initialize`, `notifications/initialized`, and as many `tools/list` requests as needed within the bounds below.
 
