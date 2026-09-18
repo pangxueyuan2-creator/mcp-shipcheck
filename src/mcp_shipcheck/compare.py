@@ -91,6 +91,54 @@ def _composition_branch_keys(value: Any) -> list[str] | None:
         return None
 
 
+def _type_set(value: Any) -> frozenset[str] | None:
+    """Normalize a valid JSON Schema ``type`` value for set comparison."""
+    if isinstance(value, str):
+        return frozenset((value,))
+    if isinstance(value, list) and value and all(isinstance(item, str) for item in value):
+        return frozenset(value)
+    return None
+
+
+def _compare_type_constraint(old: dict[str, Any], new: dict[str, Any], path: str) -> list[dict[str, str]]:
+    """Classify JSON Schema type changes by accepted-type set inclusion."""
+    old_present = "type" in old
+    new_present = "type" in new
+    old_value = old.get("type")
+    new_value = new.get("type")
+
+    if not old_present and new_present:
+        return [_change("input-restricted", "breaking", path, "input schema gained a type constraint")]
+    if old_present and not new_present:
+        return []
+    if not old_present or not new_present or old_value == new_value:
+        return []
+
+    old_types = _type_set(old_value)
+    new_types = _type_set(new_value)
+    if old_types is None or new_types is None:
+        return [_change("input-type-changed", "breaking", path, "input schema changed its type constraint")]
+    if old_types == new_types:
+        return []
+    if old_types.issubset(new_types):
+        return [
+            _change(
+                "input-type-widened",
+                "non-breaking",
+                path,
+                f"input schema widened accepted types from {sorted(old_types)!r} to {sorted(new_types)!r}",
+            )
+        ]
+    return [
+        _change(
+            "input-type-changed",
+            "breaking",
+            path,
+            f"input schema no longer accepts all prior types {sorted(old_types)!r}",
+        )
+    ]
+
+
 def _compare_composition_constraints(old: dict[str, Any], new: dict[str, Any], path: str) -> list[dict[str, str]]:
     """Conservatively classify supported ``anyOf``/``oneOf`` changes."""
     changes: list[dict[str, str]] = []
@@ -157,6 +205,7 @@ def _compare_schema(
         return changes
     seen.add(pair)
 
+    changes.extend(_compare_type_constraint(old, new, path))
     changes.extend(_compare_composition_constraints(old, new, path))
 
     old_required, new_required = _required(old), _required(new)
@@ -172,12 +221,6 @@ def _compare_schema(
 
         old_value = _deref(old_properties[field], defs_old)
         new_value = _deref(new_properties[field], defs_new)
-
-        old_type, new_type = old_value.get("type"), new_value.get("type")
-        if old_type is None and new_type is not None:
-            changes.append(_change("input-restricted", "breaking", property_path, f"input {field!r} gained a type constraint"))
-        elif new_type is not None and old_type != new_type:
-            changes.append(_change("input-type-changed", "breaking", property_path, f"input {field!r} type changed from {old_type!r} to {new_type!r}"))
 
         old_enum, new_enum = old_value.get("enum"), new_value.get("enum")
         if old_enum is None and isinstance(new_enum, list):
@@ -207,8 +250,9 @@ def _compare_schema(
                     )
                 )
 
-        # Recurse through all existing property pairs so composition keywords
-        # are checked even on primitive properties and behind local $defs refs.
+        # Recurse through all existing property pairs so type/composition
+        # keywords are checked even on primitive properties and behind local
+        # $defs refs.
         changes.extend(
             _compare_schema(
                 old_value,
@@ -230,9 +274,9 @@ def compare_snapshots(baseline: dict[str, Any], candidate: dict[str, Any]) -> di
     """Compare two snapshots and classify public tool-surface changes.
 
     A comparison is breaking when a tool disappears, a required input is added,
-    an input is removed or changes type, an enum is narrowed, a supported schema
-    constraint becomes stricter, or protocol/server capabilities change. Tool
-    descriptions deliberately do not affect the result.
+    an input is removed or narrows its accepted type set, an enum is narrowed, a
+    supported schema constraint becomes stricter, or protocol/server capabilities
+    change. Tool descriptions deliberately do not affect the result.
     """
     changes: list[dict[str, str]] = []
     baseline_tools, candidate_tools = _tools(baseline), _tools(candidate)
