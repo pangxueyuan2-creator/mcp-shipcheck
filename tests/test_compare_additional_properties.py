@@ -146,10 +146,10 @@ def test_local_defs_object_closure_is_detected() -> None:
     assert result["changes"][0]["path"] == "tools.lookup.inputSchema.properties.options.additionalProperties"
 
 
-def test_malformed_additional_properties_change_fails_closed() -> None:
+def test_malformed_candidate_additional_properties_fails_closed() -> None:
     result = _compare(
-        {"type": "object", "additionalProperties": "anything"},
         {"type": "object", "additionalProperties": True},
+        {"type": "object", "additionalProperties": "anything"},
     )
 
     assert result["compatible"] is False
