@@ -10,29 +10,17 @@ def _tools(snapshot: dict[str, Any]) -> dict[str, dict[str, Any]]:
     values = snapshot.get("tools", [])
     if not isinstance(values, list):
         return {}
-    return {
-        tool["name"]: tool
-        for tool in values
-        if isinstance(tool, dict) and isinstance(tool.get("name"), str)
-    }
+    return {tool["name"]: tool for tool in values if isinstance(tool, dict) and isinstance(tool.get("name"), str)}
 
 
 def _properties(schema: dict[str, Any]) -> dict[str, dict[str, Any]]:
     values = schema.get("properties", {}) if isinstance(schema, dict) else {}
-    return (
-        {key: value for key, value in values.items() if isinstance(value, dict)}
-        if isinstance(values, dict)
-        else {}
-    )
+    return {key: value for key, value in values.items() if isinstance(value, dict)} if isinstance(values, dict) else {}
 
 
 def _required(schema: dict[str, Any]) -> set[str]:
     values = schema.get("required", []) if isinstance(schema, dict) else []
-    return (
-        set(value for value in values if isinstance(value, str))
-        if isinstance(values, list)
-        else set()
-    )
+    return set(value for value in values if isinstance(value, str)) if isinstance(values, list) else set()
 
 
 def _change(kind: str, severity: str, path: str, message: str) -> dict[str, str]:
@@ -98,25 +86,13 @@ def _composition_branch_keys(value: Any) -> list[str] | None:
     if not isinstance(value, list):
         return None
     try:
-        return [
-            json.dumps(branch, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
-            for branch in value
-        ]
+        return [json.dumps(branch, sort_keys=True, separators=(",", ":"), ensure_ascii=False) for branch in value]
     except (TypeError, ValueError):
         return None
 
 
-def _compare_composition_constraints(
-    old: dict[str, Any], new: dict[str, Any], path: str
-) -> list[dict[str, str]]:
-    """Conservatively classify supported ``anyOf``/``oneOf`` changes.
-
-    ``anyOf`` branch additions are safe when every old branch is still present.
-    ``oneOf`` is exclusive, so adding or removing a branch can reject values that
-    previously matched exactly one branch. Structural oneOf changes therefore
-    fail closed except for pure branch reordering.
-    """
-
+def _compare_composition_constraints(old: dict[str, Any], new: dict[str, Any], path: str) -> list[dict[str, str]]:
+    """Conservatively classify supported ``anyOf``/``oneOf`` changes."""
     changes: list[dict[str, str]] = []
     for keyword in _COMPOSITION_KEYWORDS:
         old_present = keyword in old
@@ -128,63 +104,28 @@ def _compare_composition_constraints(
         keyword_path = f"{path}.{keyword}"
 
         if not old_present and new_present:
-            changes.append(
-                _change(
-                    "input-restricted",
-                    "breaking",
-                    keyword_path,
-                    f"input schema gained a {keyword} constraint",
-                )
-            )
+            changes.append(_change("input-restricted", "breaking", keyword_path, f"input schema gained a {keyword} constraint"))
             continue
-
         if old_present and not new_present:
-            # Removing a composition constraint can only widen the accepted
-            # input set at this level.
             continue
-
         if not old_present or not new_present or old_value == new_value:
             continue
-
         if old_keys is None or new_keys is None:
-            changes.append(
-                _change(
-                    "input-restricted",
-                    "breaking",
-                    keyword_path,
-                    f"input schema changed its {keyword} constraint",
-                )
-            )
+            changes.append(_change("input-restricted", "breaking", keyword_path, f"input schema changed its {keyword} constraint"))
             continue
 
         if keyword == "anyOf":
-            # anyOf is monotonic under addition of structurally identical
-            # branches: retaining every old branch and adding more alternatives
-            # cannot reject an input that previously matched.
+            # Keeping every old branch and adding alternatives cannot reject an
+            # input that previously matched at least one branch.
             if set(old_keys).issubset(set(new_keys)):
                 continue
-            changes.append(
-                _change(
-                    "input-restricted",
-                    "breaking",
-                    keyword_path,
-                    "input schema removed or changed an anyOf alternative",
-                )
-            )
+            changes.append(_change("input-restricted", "breaking", keyword_path, "input schema removed or changed an anyOf alternative"))
             continue
 
-        # oneOf requires exactly one matching branch. Branch order does not
-        # matter, but any other structural change can alter overlap and reject
-        # inputs that used to match exactly one branch.
+        # oneOf requires exactly one matching branch. Only pure reordering of
+        # the same branch multiset is provably safe without semantic reasoning.
         if sorted(old_keys) != sorted(new_keys):
-            changes.append(
-                _change(
-                    "input-restricted",
-                    "breaking",
-                    keyword_path,
-                    "input schema changed oneOf alternatives; exclusivity may narrow accepted input",
-                )
-            )
+            changes.append(_change("input-restricted", "breaking", keyword_path, "input schema changed oneOf alternatives; exclusivity may narrow accepted input"))
 
     return changes
 
@@ -220,27 +161,13 @@ def _compare_schema(
 
     old_required, new_required = _required(old), _required(new)
     for field in sorted(new_required - old_required):
-        changes.append(
-            _change(
-                "required-added",
-                "breaking",
-                f"{path}.properties.{field}",
-                f"input {field!r} became required",
-            )
-        )
+        changes.append(_change("required-added", "breaking", f"{path}.properties.{field}", f"input {field!r} became required"))
 
     old_properties, new_properties = _properties(old), _properties(new)
     for field in sorted(old_properties):
         property_path = f"{path}.properties.{field}"
         if field not in new_properties:
-            changes.append(
-                _change(
-                    "input-removed",
-                    "breaking",
-                    property_path,
-                    f"input {field!r} was removed",
-                )
-            )
+            changes.append(_change("input-removed", "breaking", property_path, f"input {field!r} was removed"))
             continue
 
         old_value = _deref(old_properties[field], defs_old)
@@ -248,85 +175,28 @@ def _compare_schema(
 
         old_type, new_type = old_value.get("type"), new_value.get("type")
         if old_type is None and new_type is not None:
-            changes.append(
-                _change(
-                    "input-restricted",
-                    "breaking",
-                    property_path,
-                    f"input {field!r} gained a type constraint",
-                )
-            )
+            changes.append(_change("input-restricted", "breaking", property_path, f"input {field!r} gained a type constraint"))
         elif new_type is not None and old_type != new_type:
-            changes.append(
-                _change(
-                    "input-type-changed",
-                    "breaking",
-                    property_path,
-                    f"input {field!r} type changed from {old_type!r} to {new_type!r}",
-                )
-            )
+            changes.append(_change("input-type-changed", "breaking", property_path, f"input {field!r} type changed from {old_type!r} to {new_type!r}"))
 
         old_enum, new_enum = old_value.get("enum"), new_value.get("enum")
         if old_enum is None and isinstance(new_enum, list):
-            changes.append(
-                _change(
-                    "input-restricted",
-                    "breaking",
-                    property_path,
-                    f"input {field!r} gained an enum constraint",
-                )
-            )
+            changes.append(_change("input-restricted", "breaking", property_path, f"input {field!r} gained an enum constraint"))
         elif isinstance(old_enum, list) and isinstance(new_enum, list):
             removed = [value for value in old_enum if value not in new_enum]
             if removed:
-                changes.append(
-                    _change(
-                        "enum-narrowed",
-                        "breaking",
-                        property_path,
-                        f"input {field!r} no longer accepts {removed!r}",
-                    )
-                )
+                changes.append(_change("enum-narrowed", "breaking", property_path, f"input {field!r} no longer accepts {removed!r}"))
 
         if "const" not in old_value and "const" in new_value:
-            changes.append(
-                _change(
-                    "input-restricted",
-                    "breaking",
-                    property_path,
-                    f"input {field!r} gained a const constraint",
-                )
-            )
-        elif (
-            "const" in old_value
-            and "const" in new_value
-            and old_value.get("const") != new_value.get("const")
-        ):
-            changes.append(
-                _change(
-                    "const-changed",
-                    "breaking",
-                    property_path,
-                    f"input {field!r} const changed",
-                )
-            )
+            changes.append(_change("input-restricted", "breaking", property_path, f"input {field!r} gained a const constraint"))
+        elif "const" in old_value and "const" in new_value and old_value.get("const") != new_value.get("const"):
+            changes.append(_change("const-changed", "breaking", property_path, f"input {field!r} const changed"))
 
         for keyword in _RESTRICTING_KEYWORDS:
             if keyword not in old_value and keyword in new_value:
-                changes.append(
-                    _change(
-                        "input-restricted",
-                        "breaking",
-                        property_path,
-                        f"input {field!r} gained a {keyword} constraint",
-                    )
-                )
-            elif (
-                keyword in old_value
-                and keyword in new_value
-                and _constraint_tightened(
-                    keyword, old_value[keyword], new_value[keyword]
-                )
+                changes.append(_change("input-restricted", "breaking", property_path, f"input {field!r} gained a {keyword} constraint"))
+            elif keyword in old_value and keyword in new_value and _constraint_tightened(
+                keyword, old_value[keyword], new_value[keyword]
             ):
                 changes.append(
                     _change(
@@ -337,10 +207,8 @@ def _compare_schema(
                     )
                 )
 
-        # Recurse through every existing property pair. Primitive schemas are
-        # cheap no-ops, while this ensures nested properties, local refs and
-        # composition constraints are all examined under the same depth/loop
-        # bounds.
+        # Recurse through all existing property pairs so composition keywords
+        # are checked even on primitive properties and behind local $defs refs.
         changes.extend(
             _compare_schema(
                 old_value,
@@ -354,20 +222,11 @@ def _compare_schema(
         )
 
     for field in sorted(new_properties.keys() - old_properties.keys() - new_required):
-        changes.append(
-            _change(
-                "input-added",
-                "non-breaking",
-                f"{path}.properties.{field}",
-                f"optional input {field!r} was added",
-            )
-        )
+        changes.append(_change("input-added", "non-breaking", f"{path}.properties.{field}", f"optional input {field!r} was added"))
     return changes
 
 
-def compare_snapshots(
-    baseline: dict[str, Any], candidate: dict[str, Any]
-) -> dict[str, Any]:
+def compare_snapshots(baseline: dict[str, Any], candidate: dict[str, Any]) -> dict[str, Any]:
     """Compare two snapshots and classify public tool-surface changes.
 
     A comparison is breaking when a tool disappears, a required input is added,
@@ -375,61 +234,26 @@ def compare_snapshots(
     constraint becomes stricter, or protocol/server capabilities change. Tool
     descriptions deliberately do not affect the result.
     """
-
     changes: list[dict[str, str]] = []
     baseline_tools, candidate_tools = _tools(baseline), _tools(candidate)
     for name in sorted(baseline_tools):
         tool_path = f"tools.{name}"
         if name not in candidate_tools:
-            changes.append(
-                _change(
-                    "tool-removed",
-                    "breaking",
-                    tool_path,
-                    f"tool {name!r} was removed",
-                )
-            )
+            changes.append(_change("tool-removed", "breaking", tool_path, f"tool {name!r} was removed"))
             continue
         old_schema = baseline_tools[name].get("inputSchema", {})
         new_schema = candidate_tools[name].get("inputSchema", {})
-        changes.extend(
-            _compare_schema(old_schema, new_schema, tool_path + ".inputSchema")
-        )
+        changes.extend(_compare_schema(old_schema, new_schema, tool_path + ".inputSchema"))
     for name in sorted(candidate_tools.keys() - baseline_tools.keys()):
-        changes.append(
-            _change(
-                "tool-added",
-                "non-breaking",
-                f"tools.{name}",
-                f"tool {name!r} was added",
-            )
-        )
+        changes.append(_change("tool-added", "non-breaking", f"tools.{name}", f"tool {name!r} was added"))
     if baseline.get("protocolVersion") != candidate.get("protocolVersion"):
-        changes.append(
-            _change(
-                "protocol-version-changed",
-                "breaking",
-                "protocolVersion",
-                "protocol version changed",
-            )
-        )
+        changes.append(_change("protocol-version-changed", "breaking", "protocolVersion", "protocol version changed"))
     if baseline.get("capabilities", {}) != candidate.get("capabilities", {}):
-        changes.append(
-            _change(
-                "capabilities-changed",
-                "breaking",
-                "capabilities",
-                "server capabilities changed",
-            )
-        )
+        changes.append(_change("capabilities-changed", "breaking", "capabilities", "server capabilities changed"))
     breaking = [change for change in changes if change["severity"] == "breaking"]
     return {
         "format": "mcp-shipcheck/compare/v1",
         "compatible": not breaking,
-        "summary": {
-            "breaking": len(breaking),
-            "nonBreaking": len(changes) - len(breaking),
-            "total": len(changes),
-        },
+        "summary": {"breaking": len(breaking), "nonBreaking": len(changes) - len(breaking), "total": len(changes)},
         "changes": changes,
     }
