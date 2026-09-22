@@ -16,6 +16,13 @@ MCP ShipCheck compares `additionalProperties` at the input-schema root, on neste
 
 The comparison intentionally does not emit a non-breaking change record for pure openness widening. Its job here is to prevent a release from being labeled compatible when the accepted object-input set shrinks.
 
+The identity of a schema-valued policy includes its reachable supported local
+`#/$defs/...` targets. An unchanged reference whose target changes is therefore
+classified as a changed schema. Unused definitions are ignored. Dependency
+scanning has the same supported positions, cycle handling, depth/node bounds,
+and conservative unresolved-reference behavior described in
+[`schema-composition.md`](schema-composition.md#scope-and-identity).
+
 ## Example
 
 A server that changes from:
