@@ -6,12 +6,7 @@ import json
 from math import isfinite
 from typing import Any
 
-
-def _tools(snapshot: dict[str, Any]) -> dict[str, dict[str, Any]]:
-    values = snapshot.get("tools", [])
-    if not isinstance(values, list):
-        return {}
-    return {tool["name"]: tool for tool in values if isinstance(tool, dict) and isinstance(tool.get("name"), str)}
+from .catalog import validate_snapshot_catalog
 
 
 def _properties(schema: dict[str, Any]) -> dict[str, dict[str, Any]]:
@@ -446,7 +441,8 @@ def compare_snapshots(baseline: dict[str, Any], candidate: dict[str, Any]) -> di
     affect the result.
     """
     changes: list[dict[str, str]] = []
-    baseline_tools, candidate_tools = _tools(baseline), _tools(candidate)
+    baseline_tools = validate_snapshot_catalog(baseline, source="baseline snapshot")
+    candidate_tools = validate_snapshot_catalog(candidate, source="candidate snapshot")
     for name in sorted(baseline_tools):
         tool_path = f"tools.{name}"
         if name not in candidate_tools:

@@ -17,6 +17,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Iterable
 
+from .catalog import validate_input_schema
+
 PROTOCOL_VERSION = "2024-11-05"
 SUPPORTED_PROTOCOL_VERSIONS = frozenset({PROTOCOL_VERSION})
 MAX_JSONRPC_LINE = 1_048_576
@@ -192,9 +194,10 @@ def _request(
 
 
 def _normalize_tool(tool: dict[str, Any]) -> dict[str, Any]:
-    schema = tool.get("inputSchema", {})
-    if not isinstance(schema, dict):
-        schema = {"_invalidInputSchema": True}
+    try:
+        schema = validate_input_schema(tool.get("inputSchema"), source="tools/list tool")
+    except ValueError as exc:
+        raise ProtocolError(str(exc)) from None
     normalized: dict[str, Any] = {"name": tool.get("name", "")}
     if "description" in tool:
         normalized["description"] = tool["description"]
