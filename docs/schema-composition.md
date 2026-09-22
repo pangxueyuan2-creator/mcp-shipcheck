@@ -26,4 +26,21 @@ Composition checks apply at the tool input-schema root, inside ordinary properti
 
 Branch identity is structural, not semantic: objects are canonicalized with sorted JSON keys. Two schemas that are logically equivalent but written with different structures can still be treated as different. This bias is intentional for a release gate: a false-positive review request is preferable to silently approving a contract narrowing that ShipCheck cannot prove safe.
 
+Branch identity also includes reachable supported local `#/$defs/...` targets.
+Keeping the same reference text while changing its target is a structural
+change. This applies even to target widening in `oneOf`, which can introduce
+overlap and reject inputs that previously matched exactly one branch. Changes
+to unused definitions do not affect branch identity. Dependency values preserve
+JSON's distinction between booleans and numbers; equal numbers such as `1` and
+`1.0` have the same identity.
+
+The dependency scan follows ordinary `properties`, `anyOf`, `oneOf`, and
+schema-valued `additionalProperties`, plus chains of the existing supported
+local references. It does not interpret reference-shaped data inside `enum`,
+`const`, or annotations. Each referenced target is recorded once, including in
+cycles. A branch scan is bounded to depth 8 and 256 schema nodes; an unresolved
+local target or an exceeded bound is conservatively breaking, even if the raw
+branch text is unchanged. This does not add remote references, JSON Pointer
+escape handling, nested identifier scopes, or `$ref` sibling semantics.
+
 Unsupported JSON Schema constructs remain outside ShipCheck's compatibility claim. A compatible result means no breaking change was found within the documented subset; it is not a proof of full JSON Schema equivalence.

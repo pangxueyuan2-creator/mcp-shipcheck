@@ -29,6 +29,7 @@ def _change(kind: str, severity: str, path: str, message: str) -> dict[str, str]
 
 
 _MAX_SCHEMA_DEPTH = 8
+_MAX_REFERENCE_SCAN_NODES = 256
 _RESTRICTING_KEYWORDS = (
     "pattern",
     "minLength",
@@ -81,6 +82,77 @@ def _deref(schema: dict[str, Any], defs: dict[str, Any]) -> dict[str, Any]:
         seen_refs.add(ref)
         current = target
     return current
+
+
+def _reference_dependencies(
+    schema: Any, defs: dict[str, Any],
+    target_identities: dict[str, tuple[Any, ...] | None] | None = None,
+) -> tuple[Any, ...] | None:
+    """Identify reachable supported local targets without recursively expanding refs.
+
+    Only schema positions are visited: reference-shaped literal/annotation data
+    is not a dependency. None means the bounded scan could not establish an
+    identity and must not be used as evidence of compatibility.
+    """
+    pending = [(schema, 0)]
+    targets: dict[str, Any] = {}
+    visited = 0
+    while pending:
+        current, depth = pending.pop()
+        if not isinstance(current, dict):
+            continue
+        ref = current.get("$ref")
+        local_ref = isinstance(ref, str) and ref.startswith("#/$defs/")
+        if local_ref and ref in targets:
+            continue
+        visited += 1
+        if depth > _MAX_SCHEMA_DEPTH or visited > _MAX_REFERENCE_SCAN_NODES:
+            return None
+        if local_ref:
+            target = defs.get(ref[len("#/$defs/") :])
+            if not isinstance(target, dict):
+                return None
+            targets[ref] = target
+            pending.append((target, depth + 1))
+            # Match the existing local resolver's supported target-only scope.
+            continue
+        pending.extend((child, depth + 1) for child in _properties(current).values())
+        for keyword in _COMPOSITION_KEYWORDS:
+            branches = current.get(keyword)
+            if isinstance(branches, list):
+                pending.extend((branch, depth + 1) for branch in branches)
+        additional = current.get("additionalProperties")
+        if isinstance(additional, dict):
+            pending.append((additional, depth + 1))
+    target_identities = {} if target_identities is None else target_identities
+    entries = []
+    for ref in sorted(targets):
+        if ref not in target_identities:
+            target_identities[ref] = _json_value_identity(targets[ref])
+        identity = target_identities[ref]
+        if identity is None:
+            return None
+        entries.append((ref, identity))
+    return ("object", tuple(entries))
+
+
+def _reference_branch_keys(value: Any, defs: dict[str, Any]) -> list[tuple[Any, ...]] | None:
+    if not isinstance(value, list):
+        return None
+    keys = []
+    cached_keys: dict[tuple[Any, ...], tuple[Any, ...]] = {}
+    target_identities: dict[str, tuple[Any, ...] | None] = {}
+    for branch in value:
+        identity = _json_value_identity(branch)
+        if identity is None:
+            return None
+        if identity not in cached_keys:
+            dependencies = _reference_dependencies(branch, defs, target_identities)
+            if dependencies is None:
+                return None
+            cached_keys[identity] = (identity, dependencies)
+        keys.append(cached_keys[identity])
+    return keys
 
 
 def _composition_branch_keys(value: Any) -> list[str] | None:
@@ -233,7 +305,10 @@ def _compare_literal_constraints(old: dict[str, Any], new: dict[str, Any], path:
     return changes
 
 
-def _compare_composition_constraints(old: dict[str, Any], new: dict[str, Any], path: str) -> list[dict[str, str]]:
+def _compare_composition_constraints(
+    old: dict[str, Any], new: dict[str, Any], path: str,
+    defs_old: dict[str, Any], defs_new: dict[str, Any],
+) -> list[dict[str, str]]:
     """Conservatively classify supported ``anyOf``/``oneOf`` changes."""
     changes: list[dict[str, str]] = []
     for keyword in _COMPOSITION_KEYWORDS:
@@ -245,6 +320,17 @@ def _compare_composition_constraints(old: dict[str, Any], new: dict[str, Any], p
         new_keys = _composition_branch_keys(new_value)
         keyword_path = f"{path}.{keyword}"
 
+        if old_present and new_present:
+            old_ref_keys = _reference_branch_keys(old_value, defs_old)
+            new_ref_keys = _reference_branch_keys(new_value, defs_new)
+            retained = old_ref_keys is not None and new_ref_keys is not None
+            if retained:
+                retained = (set(old_ref_keys).issubset(set(new_ref_keys)) if keyword == "anyOf"
+                            else sorted(old_ref_keys) == sorted(new_ref_keys))
+            if not retained:
+                changes.append(_change("input-restricted", "breaking", keyword_path,
+                                       f"input schema changed {keyword} alternatives or their local reference dependencies"))
+                continue
         if not old_present and new_present:
             changes.append(_change("input-restricted", "breaking", keyword_path, f"input schema gained a {keyword} constraint"))
             continue
@@ -286,7 +372,10 @@ def _additional_properties_mode(schema: dict[str, Any]) -> tuple[str, Any]:
     return ("invalid", value)
 
 
-def _compare_additional_properties(old: dict[str, Any], new: dict[str, Any], path: str) -> list[dict[str, str]]:
+def _compare_additional_properties(
+    old: dict[str, Any], new: dict[str, Any], path: str,
+    defs_old: dict[str, Any], defs_new: dict[str, Any],
+) -> list[dict[str, str]]:
     """Detect object-schema changes that reject previously accepted extra keys.
 
     Missing ``additionalProperties`` is equivalent to ``true``. Schema-valued
@@ -294,6 +383,13 @@ def _compare_additional_properties(old: dict[str, Any], new: dict[str, Any], pat
     to allowing extras, while a new or changed non-empty schema is considered a
     restriction unless the old schema denied extras entirely.
     """
+    if isinstance(old.get("additionalProperties"), dict) and isinstance(new.get("additionalProperties"), dict):
+        old_dependencies = _reference_dependencies(old["additionalProperties"], defs_old)
+        new_dependencies = _reference_dependencies(new["additionalProperties"], defs_new)
+        if old_dependencies is None or new_dependencies is None or old_dependencies != new_dependencies:
+            return [_change("additional-properties-changed", "breaking", f"{path}.additionalProperties",
+                            "input schema changed or could not resolve local reference dependencies for additional properties")]
+
     old_mode, old_value = _additional_properties_mode(old)
     new_mode, new_value = _additional_properties_mode(new)
     keyword_path = f"{path}.additionalProperties"
@@ -384,8 +480,8 @@ def _compare_schema(
 
     changes.extend(_compare_type_constraint(old, new, path))
     changes.extend(_compare_literal_constraints(old, new, path))
-    changes.extend(_compare_composition_constraints(old, new, path))
-    changes.extend(_compare_additional_properties(old, new, path))
+    changes.extend(_compare_composition_constraints(old, new, path, defs_old, defs_new))
+    changes.extend(_compare_additional_properties(old, new, path, defs_old, defs_new))
 
     old_required, new_required = _required(old), _required(new)
     for field in sorted(new_required - old_required):
