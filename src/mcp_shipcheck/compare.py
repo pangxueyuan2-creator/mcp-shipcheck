@@ -153,6 +153,12 @@ def _enum_identities(value: Any) -> list[tuple[Any, ...]] | None:
     return identities
 
 
+def _json_values_equal(old: Any, new: Any) -> bool:
+    """Compare JSON values without treating booleans as equal to numbers."""
+    old_identity = _json_value_identity(old)
+    return old_identity is not None and old_identity == _json_value_identity(new)
+
+
 def _compare_type_constraint(old: dict[str, Any], new: dict[str, Any], path: str) -> list[dict[str, str]]:
     """Classify JSON Schema type changes by accepted-type set inclusion."""
     old_present = "type" in old
@@ -250,7 +256,7 @@ def _compare_composition_constraints(old: dict[str, Any], new: dict[str, Any], p
             continue
         if old_present and not new_present:
             continue
-        if not old_present or not new_present or old_value == new_value:
+        if not old_present or not new_present or _json_values_equal(old_value, new_value):
             continue
         if old_keys is None or new_keys is None:
             changes.append(_change("input-restricted", "breaking", keyword_path, f"input schema changed its {keyword} constraint"))
@@ -298,7 +304,7 @@ def _compare_additional_properties(old: dict[str, Any], new: dict[str, Any], pat
     new_mode, new_value = _additional_properties_mode(new)
     keyword_path = f"{path}.additionalProperties"
 
-    if old_mode == new_mode and old_value == new_value:
+    if old_mode == new_mode and _json_values_equal(old_value, new_value):
         return []
 
     # Once extra keys were forbidden, allowing all extras or allowing a subset
