@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -35,14 +36,56 @@ def _write_json(value: dict[str, Any], output: str | None) -> None:
         sys.stdout.write(payload)
 
 
+def _validate_output_paths(inputs: dict[str, str], outputs: dict[str, str]) -> None:
+    """Reject output aliases before a probe or any file write can happen."""
+    paths: dict[str, Path] = {}
+    try:
+        for label, value in {**inputs, **outputs}.items():
+            paths[label] = Path(value).resolve()
+        if os.name == "nt":
+            for label in outputs:
+                if any(part.endswith((".", " ")) for part in paths[label].parts):
+                    raise ValueError(
+                        f"{label} must not use Windows path components ending in a dot or space"
+                    )
+                if any(":" in part for part in paths[label].parts[1:]):
+                    raise ValueError(f"{label} must not use Windows alternate data streams")
+        checked = list(inputs)
+        for label in outputs:
+            path = paths[label]
+            for other_label in checked:
+                other = paths[other_label]
+                aliases = os.path.normcase(str(path)) == os.path.normcase(str(other))
+                if not aliases:
+                    try:
+                        aliases = path.samefile(other)
+                    except FileNotFoundError:
+                        # Either destination may legitimately not exist yet.
+                        pass
+                if aliases:
+                    raise ValueError(f"{label} and {other_label} refer to the same file")
+            checked.append(label)
+    except (OSError, RuntimeError) as exc:
+        raise ValueError(f"could not validate snapshot paths: {exc}") from exc
+
+
 def _verify(args: argparse.Namespace) -> int:
     if not args.command:
         raise ValueError("verify requires a server command after '--'")
+    inputs = {"--baseline": args.baseline} if args.baseline else {}
+    outputs = {"--output": args.output}
+    if args.baseline and args.compare_output:
+        outputs["--compare-output"] = args.compare_output
+    _validate_output_paths(inputs, outputs)
+    baseline = _read_snapshot(args.baseline) if args.baseline else None
     snapshot = probe_command(args.command, timeout=args.timeout)
     _write_json(snapshot, args.output)
-    if args.baseline:
-        result = compare_snapshots(_read_snapshot(args.baseline), snapshot)
+    if baseline is not None:
+        result = compare_snapshots(baseline, snapshot)
         if args.compare_output:
+            # Creating the candidate can assign a new Windows 8.3 alias that
+            # did not exist during preflight. Never let a report replace it.
+            _validate_output_paths(inputs, outputs)
             _write_json(result, args.compare_output)
         if not result["compatible"]:
             print(f"mcp-shipcheck: {result['summary']['breaking']} breaking change(s)", file=sys.stderr)
@@ -51,6 +94,10 @@ def _verify(args: argparse.Namespace) -> int:
 
 
 def _compare(args: argparse.Namespace) -> int:
+    if args.output:
+        _validate_output_paths(
+            {"baseline": args.baseline, "candidate": args.candidate}, {"--output": args.output}
+        )
     result = compare_snapshots(_read_snapshot(args.baseline), _read_snapshot(args.candidate))
     _write_json(result, args.output)
     if not result["compatible"]:
