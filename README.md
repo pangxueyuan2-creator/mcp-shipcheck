@@ -27,6 +27,8 @@ mcp-shipcheck verify --baseline .shipcheck/baseline.json \
 
 A successful compatible run exits `0`. A server startup/protocol failure exits `1`. A server that starts but breaks the baseline exits `2`, which is convenient for a CI release gate.
 
+Keep baseline, candidate, and comparison-output paths separate. Both commands reject an output that aliases an input, and `verify` also rejects overlapping candidate/report outputs. Existing hard links, symbolic links, relative-path aliases, and Windows case aliases are checked before starting the server or writing files. Windows output paths with components ending in a dot or space, or naming alternate data streams, are rejected. Invalid or missing baselines also fail before probing. These preflight errors exit `1` and leave existing snapshots unchanged. A Windows short-name alias can appear when a new candidate file is created; paths are checked again before writing its report, and a conflict exits `1` while retaining that new candidate snapshot. `compare` may still read the same snapshot twice when its report has a separate destination.
+
 ## Killer feature: artifact-aware compatibility evidence
 
 A source-tree unit test cannot catch a package that forgot to ship an environment-variable fix, a command that fails in an editor/CI `PATH`, or a server whose installed dependency changed its public tool schema. ShipCheck probes the **command and environment you choose**, then compares only client-visible release data.
