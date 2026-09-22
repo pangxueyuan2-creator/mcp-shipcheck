@@ -43,15 +43,19 @@ ShipCheck reports a breaking change when it observes a removed tool, removed inp
 
 Snapshot JSON is deterministic except for the observation timestamp and probe duration. It contains server info, capabilities, tool names, descriptions and input schemas. It does **not** contain tool call inputs, tool results, environment variables, pagination cursors, or server stderr. The probe sends `initialize`, `notifications/initialized`, and as many `tools/list` requests as needed within the bounds below.
 
+Both catalogs must be structurally valid before comparison: `tools` must be an array, each tool must have a unique non-empty string name, and every `inputSchema` must be an object. Invalid catalogs exit `1` without producing a compatibility result; they are not classified as compatible or as a normal breaking release (`2`). The Python API continues to accept minimal snapshots containing only `tools`. See [snapshot catalog validation](docs/snapshot-catalogs.md).
+
 ### Complete paginated tool catalogs
 
 ShipCheck follows opaque `nextCursor` values, including empty strings, until the server omits the cursor. It merges every page into a single sorted catalog before writing a candidate snapshot or comparing contracts. This catches a removed or changed tool even when it appears after the first page. See the supported [MCP 2024-11-05 pagination protocol](https://modelcontextprotocol.io/specification/2024-11-05/server/utilities/pagination).
 
-The probe rejects repeated cursors, duplicate tool names (including across pages), malformed pages, and later-page errors. It limits a catalog to 100 pages, 10,000 tools, and 16 MiB of re-encoded JSON result data; each stdout line is limited to 1 MiB. Exceeding a limit exits `1` without writing a partial candidate snapshot. An existing output file is left unchanged on probe failure, so callers must honor the exit code rather than reuse stale output.
+The probe rejects repeated cursors, duplicate tool names (including across pages), malformed pages, missing or non-object input schemas, and later-page errors. It limits a catalog to 100 pages, 10,000 tools, and 16 MiB of re-encoded JSON result data; each stdout line is limited to 1 MiB. Exceeding a limit exits `1` without writing a partial candidate snapshot. An existing output file is left unchanged on probe failure, so callers must honor the exit code rather than reuse stale output.
 
 `--timeout` must be finite and positive. It applies once to initialization and separately to the **entire** tool listing, including all pages and interleaved notifications. It is not renewed for every page. Increase it explicitly for servers with large catalogs.
 
 The `mcp-shipcheck/v1` snapshot shape is unchanged. **Regenerate trusted baselines previously collected from paginated servers:** older versions captured only page one, and an old snapshot cannot prove whether additional pages existed. Unpaginated baselines continue to work.
+
+Older releases could replace an invalid server input schema with `{"_invalidInputSchema": true}`. Such snapshots are now rejected explicitly. Fix the server's schema and regenerate affected snapshots, including trusted baselines; removing the marker cannot recover the missing contract.
 
 ## Full local demo
 

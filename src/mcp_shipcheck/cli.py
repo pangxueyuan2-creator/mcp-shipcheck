@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from . import __version__
+from .catalog import validate_snapshot_catalog
 from .compare import compare_snapshots
 from .probe import ShipcheckError, probe_command
 
@@ -22,6 +23,7 @@ def _read_snapshot(path: str) -> dict[str, Any]:
         raise ValueError(f"snapshot {path!r} is not valid JSON: {exc}") from exc
     if not isinstance(value, dict) or value.get("format") != "mcp-shipcheck/v1":
         raise ValueError(f"snapshot {path!r} is not an mcp-shipcheck/v1 snapshot")
+    validate_snapshot_catalog(value, source=f"snapshot {path!r}")
     return value
 
 
